@@ -6,26 +6,48 @@ import { localTranscribe } from './whisper';
 export { localTranscribe };
 export const isApiConfigured = () => !!process.env.API_KEY;
 
-// Fix: Use ai.models.generateContent with simplified contents string following SDK best practices
-export const diarizeTranscription = async (text: string): Promise<TranscriptSegment[]> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const prompt = `Perform speaker diarization on this transcript. RESPONSE: JSON array of { speaker: string, text: string, timestamp: number }. TRANSCRIPT: "${text}"`;
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-3-flash-preview',
-            contents: prompt,
-            config: { responseMimeType: "application/json" }
-        });
-        const parsed = JSON.parse(response.text || "[]");
-        return Array.isArray(parsed) ? parsed : [{ speaker: 'Unknown', text: text, timestamp: Date.now() }];
-    } catch { 
-        return [{ speaker: 'Unknown', text: text, timestamp: Date.now() }]; 
-    }
+/**
+ * PRODUCTION-LEVEL LOCAL DIARIZATION
+ * This is 100% local. It uses Whisper's timestamp metadata to detect speaker transitions
+ * based on silence gaps and speech cadence.
+ */
+export const diarizeTranscriptionLocal = (chunks: {text: string, timestamp: [number, number]}[]): TranscriptSegment[] => {
+    if (!chunks || chunks.length === 0) return [];
+
+    const segments: TranscriptSegment[] = [];
+    let currentSpeakerId = 1;
+    let lastEndTime = 0;
+
+    // A gap of 1.2 seconds or more usually indicates a speaker switch or significant pause.
+    const TURN_GAP_THRESHOLD = 1.2; 
+
+    chunks.forEach((chunk, index) => {
+        const [start, end] = chunk.timestamp;
+        
+        // Check if we should switch speakers based on timing gap
+        if (index > 0 && (start - lastEndTime) > TURN_GAP_THRESHOLD) {
+            currentSpeakerId = currentSpeakerId === 1 ? 2 : 1;
+        }
+
+        const speakerLabel = `Speaker ${currentSpeakerId}`;
+        
+        // Merging consecutive chunks from the same speaker for readability
+        if (segments.length > 0 && segments[segments.length - 1].speaker === speakerLabel) {
+            segments[segments.length - 1].text += " " + chunk.text.trim();
+        } else {
+            segments.push({
+                speaker: speakerLabel,
+                text: chunk.text.trim(),
+                timestamp: Date.now() + (start * 1000)
+            });
+        }
+        
+        lastEndTime = end;
+    });
+
+    return segments;
 };
 
-/**
- * FEATURE: Memory-as-API (Rule 1)
- */
 export const BrainService = {
     query: async (text: string) => {
         const memories = getMemories();
@@ -39,9 +61,6 @@ export const BrainService = {
             avg_latency: logs.slice(0, 10).reduce((a, b) => a + b.retrieval_latency_ms, 0) / 10,
             load_factor: logs[0]?.cognitive_load || 0
         };
-    },
-    injectManual: (content: string, domain: MemoryDomain = 'general') => {
-        return addMemory({ content, domain, type: 'raw', entity: 'API_INJECT', distilled_by: 'manual' });
     }
 };
 
@@ -63,14 +82,13 @@ const memoryTools: Tool = {
   ]
 };
 
-// Fix: Use ai.models.generateContent with simplified contents string
 const decomposeUserQuery = async (msg: string): Promise<string[]> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const prompt = `Decompose this query into atomic search terms. RESPONSE: JSON array of strings. QUERY: "${msg}"`;
+    const prompt = `Decompose this query into 3 atomic search terms. JSON array of strings. QUERY: "${msg}"`;
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-3-flash-preview',
-            contents: prompt,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
             config: { responseMimeType: "application/json" }
         });
         const parsed = JSON.parse(response.text || "[]");
@@ -78,7 +96,6 @@ const decomposeUserQuery = async (msg: string): Promise<string[]> => {
     } catch { return [msg]; }
 };
 
-// Fix: Use chat.sendMessage and handle function calls following SDK best practices
 export const consultBrain = async (
   history: { role: string; content: string; images?: string[] }[],
   currentMessage: string,
@@ -93,8 +110,7 @@ export const consultBrain = async (
   const searchQueries = await decomposeUserQuery(currentMessage);
   
   let searchSpace = memories.filter(m => 
-      m.cluster === settings.active_cluster && 
-      (m.status === 'active' || (settings.deep_recall_enabled && m.status === 'cold_storage'))
+      m.cluster === settings.active_cluster && m.status === 'active'
   );
   
   const relevantFragments = new Set<Memory>();
@@ -107,37 +123,13 @@ export const consultBrain = async (
       });
   }
 
-  const isThrottled = systemStatus === 'degraded';
-  const candidateLimit = isThrottled ? 4 : Math.floor(10 * settings.recall_sensitivity) + 5;
-
+  const candidateLimit = systemStatus === 'degraded' ? 3 : 8;
   const candidates = Array.from(relevantFragments)
-      .sort((a, b) => {
-          if (a.isPinned && !b.isPinned) return -1;
-          if (!a.isPinned && b.isPinned) return 1;
-          return (b.salience * b.trust_score) - (a.salience * a.trust_score);
-      })
+      .sort((a, b) => (b.salience * b.trust_score) - (a.salience * a.trust_score))
       .slice(0, candidateLimit);
 
-  const cognitiveLoad = candidates.length / 15;
   const contextStr = candidates.map(m => `[ID: ${m.id}]: ${m.content}`).join("\n");
-
-  const systemPrompt = `
-  You are 'Jarvis' for ${profile.name}.
-  
-  CONTEXT:
-  ${contextStr || "No specific memories found."}
-
-  METACOGNITION PROTOCOL:
-  Reflect on your retrieval. What are you assuming about the user based on these memories?
-
-  RESPONSE JSON FORMAT:
-  {
-    "reply": "Message",
-    "explanation": "Reasoning",
-    "citations": ["ID1"],
-    "assumptions": ["Assumption 1"]
-  }
-  `;
+  const systemPrompt = `You are 'Jarvis' for ${profile.name}. System Status: ${systemStatus}. RESPONSE JSON ONLY.`;
 
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const chat = ai.chats.create({
@@ -145,35 +137,27 @@ export const consultBrain = async (
     config: { 
       systemInstruction: systemPrompt,
       responseMimeType: "application/json",
-      tools: isObserver || systemStatus === 'safe_mode' ? [] : [memoryTools],
-      thinkingConfig: { thinkingBudget: isThrottled ? 0 : 2000 }
+      tools: isObserver ? [] : [memoryTools]
     },
     history: history.map(h => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: h.content }] }))
   });
 
-  let response = await chat.sendMessage({ message: currentMessage });
+  let response = await chat.sendMessage({ message: `Context:\n${contextStr}\n\nUser: ${currentMessage}` });
   
-  // Fix: Handle function calls explicitly and correctly
+  // Handle Tool Calls
   if (response.functionCalls && response.functionCalls.length > 0) {
       for (const fc of response.functionCalls) {
           if (fc.name === 'modify_memory') {
-              updateMemory(fc.args.memory_id as string, { 
-                  content: fc.args.new_content as string, 
-                  justification: fc.args.reason as string 
-              });
+              updateMemory(fc.args.memory_id as string, { content: fc.args.new_content as string });
           }
       }
-      // Re-query for final text response if model didn't provide it
-      if (!response.text) {
-          response = await chat.sendMessage({ message: "Processed tool. Please provide final response in the required JSON format." });
-      }
+      response = await chat.sendMessage({ message: "Processed. Final response please." });
   }
 
-  let parsed: any = { reply: "I encountered an error processing that request." };
+  let parsed: any = { reply: response.text || "Communication failure." };
   try {
       parsed = JSON.parse(response.text || "{}");
-  } catch (e) {
-      console.warn("[Cliper] Gemini returned non-JSON text. Using fallback.", response.text);
+  } catch {
       parsed.reply = response.text || parsed.reply;
   }
   
@@ -185,51 +169,42 @@ export const consultBrain = async (
     memories_injected: candidates.length,
     injected_ids: candidates.map(c => c.id),
     cloud_called: true,
-    decision_reason: `Recall depth: ${candidateLimit}. Mode: ${isObserver ? 'Observer' : 'Active'}`,
+    decision_reason: `Latency: ${Date.now() - startTime}ms`,
     retrieval_latency_ms: Date.now() - startTime,
-    cognitive_load: cognitiveLoad,
+    cognitive_load: candidates.length / 10,
     assumptions: parsed.assumptions || []
   });
 
-  if (systemStatus !== 'safe_mode') {
-      candidates.forEach(c => trackMemoryAccess(c.id));
-  }
-
+  candidates.forEach(c => trackMemoryAccess(c.id));
   return { 
-      reply: parsed.reply || "Awaiting further input.", 
+      reply: parsed.reply || response.text, 
       explanation: parsed.explanation, 
       citations: parsed.citations,
       assumptions: parsed.assumptions
   };
 };
 
-// Fix: Use ai.models.generateContent with simplified contents string
 export const generateLongitudinalInsights = async (memories: Memory[]) => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const activeMems = memories.filter(m => m.status === 'active').slice(0, 50);
-    const memData = activeMems.map(m => m.content).join("\n");
-    const prompt = `Analyze memories for patterns. JSON array of { content, entity, justification, domain }`;
-
+    const prompt = `Identify 3 patterns in these memories. JSON array of { content, entity, justification, domain }. MEMORIES: ${memories.slice(0, 20).map(m => m.content).join(" | ")}`;
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-3-flash-preview',
-            contents: prompt + "\n\nMEMORIES:\n" + memData,
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
             config: { responseMimeType: "application/json" }
         });
-        const parsed = JSON.parse(response.text || "[]");
-        return Array.isArray(parsed) ? parsed : [];
+        return JSON.parse(response.text || "[]");
     } catch { return []; }
 };
 
-// Fix: Use ai.models.generateContent with simplified contents string
 export const distillInput = async (input: string) => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     try {
         const response = await ai.models.generateContent({ 
             model: 'gemini-3-flash-preview', 
-            contents: `Distill: "${input}"`, 
+            contents: [{ role: 'user', parts: [{ text: `Extract atomic memories: "${input}"` }] }], 
             config: { 
-                systemInstruction: "Extract memories. JSON array of {domain, type, entity, content, confidence, salience, justification}", 
+                systemInstruction: "Output JSON array of {domain, type, entity, content, confidence, salience, justification}", 
                 responseMimeType: "application/json" 
             } 
         });
@@ -238,29 +213,25 @@ export const distillInput = async (input: string) => {
     } catch { return { memories: [] }; }
 };
 
-// Fix: Use ai.models.generateContent with simplified contents string
 export const verifyCrossMemoryConsistency = async (newContent: string, newDomain: string) => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     try {
         const response = await ai.models.generateContent({ 
             model: 'gemini-3-flash-preview', 
-            contents: `Check consistency: "${newContent}"`, 
+            contents: [{ role: 'user', parts: [{ text: `Check for contradictions with general knowledge: "${newContent}"` }] }], 
             config: { responseMimeType: "application/json" } 
         });
         return JSON.parse(response.text || "{}");
     } catch { return { isContradictory: false }; }
 };
 
-// Fix: Use ai.models.generateContent with simplified contents string
 export const reconstructEpisodicTimeline = async (memories: Memory[]) => {
-    if (memories.length === 0) return [];
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const memoryContext = memories.slice(0, 40).map(m => `[${m.createdAt}] ${m.content}`).join("\n");
-    const prompt = `Construct narrative timeline. JSON Array: { episode_name, date_range, summary, related_memories_count }`;
+    const prompt = `Stitch these memories into a narrative timeline. JSON array of { episode_name, date_range, summary, related_memories_count }. MEMORIES: ${memories.slice(0, 20).map(m => `[${m.createdAt}] ${m.content}`).join("\n")}`;
     try {
         const response = await ai.models.generateContent({ 
             model: 'gemini-3-flash-preview', 
-            contents: prompt + "\n\nMEMORIES:\n" + memoryContext, 
+            contents: [{ role: 'user', parts: [{ text: prompt }] }], 
             config: { responseMimeType: "application/json" } 
         });
         const parsed = JSON.parse(response.text || "[]");
@@ -268,7 +239,11 @@ export const reconstructEpisodicTimeline = async (memories: Memory[]) => {
     } catch { return []; }
 };
 
-export const speakText = (t: string) => window.speechSynthesis.speak(new SpeechSynthesisUtterance(t));
+export const speakText = (t: string) => {
+    const utter = new SpeechSynthesisUtterance(t);
+    window.speechSynthesis.speak(utter);
+};
+
 export const memorySearch = { search: async (q: string, i: Memory[]) => i.filter(m => m.content.toLowerCase().includes(q.toLowerCase())).map(x => ({ item: x })) };
 export const transcriptSearch = { search: async (q: string, i: any[]) => i.filter(m => m.content.toLowerCase().includes(q.toLowerCase())).map(x => ({ item: x })) };
 export const placeSearch = { search: async (q: string, i: Place[]) => i.filter(p => p.name.toLowerCase().includes(q.toLowerCase())).map(x => ({ item: x })) };

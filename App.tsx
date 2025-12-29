@@ -22,13 +22,15 @@ const App: React.FC = () => {
   const [isConfigured, setIsConfigured] = useState(isApiConfigured());
   const [isBooting, setIsBooting] = useState(true);
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+  // Fix: Added missing 'cognitive_saturation' property to comply with SystemHealth interface
   const [health, setHealth] = useState<SystemHealth>({
     status: 'nominal',
     storage_pressure: 0,
     avg_latency: 0,
     queue_depth: 0,
     boot_errors: [],
-    anomalies_detected: 0
+    anomalies_detected: 0,
+    cognitive_saturation: 0
   });
   const [viewProps, setViewProps] = useState<any>({});
 
@@ -71,6 +73,7 @@ const App: React.FC = () => {
         const queue = getQueue();
         const recentLatency = logs.slice(0, 5).reduce((acc, l) => acc + (l.retrieval_latency_ms || 0), 0) / 5;
         const anomalyCount = logs.filter(l => l.anomaly_score && l.anomaly_score > 0.6).length;
+        const cogSaturation = logs[0]?.cognitive_load || 0;
 
         setHealth(prev => ({
             ...prev,
@@ -78,6 +81,7 @@ const App: React.FC = () => {
             avg_latency: recentLatency,
             queue_depth: queue.length,
             anomalies_detected: anomalyCount,
+            cognitive_saturation: cogSaturation,
             status: (usage.percent > 90 || recentLatency > 2000 || anomalyCount > 3) ? 'degraded' : (prev.status === 'safe_mode' ? 'safe_mode' : 'nominal')
         }));
      }, 10000);
