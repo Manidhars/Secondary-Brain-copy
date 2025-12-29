@@ -22,6 +22,7 @@ const App: React.FC = () => {
   const [isConfigured, setIsConfigured] = useState(isApiConfigured());
   const [isBooting, setIsBooting] = useState(true);
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [health, setHealth] = useState<SystemHealth>({
     status: 'nominal',
     storage_pressure: 0,
@@ -36,11 +37,13 @@ const App: React.FC = () => {
      const boot = async () => {
          // Step 1: Initialize storage (handles decryption if enabled)
          await initializeStorage();
-         
+
          // Step 2: Perform safety checks
          const errors = runSystemBootCheck();
          if (errors.length > 0) {
-             setHealth(prev => ({ ...prev, status: 'safe_mode', boot_errors: errors }));
+             const hasCritical = errors.some(e => e.toLowerCase().includes('unreachable'));
+             setHealth(prev => ({ ...prev, status: hasCritical ? 'safe_mode' : prev.status, boot_errors: errors }));
+             setWarnings(prev => Array.from(new Set([...prev, ...errors])));
          }
          
          setIsBooting(false);
@@ -71,15 +74,32 @@ const App: React.FC = () => {
         const queue = getQueue();
         const recentLatency = logs.slice(0, 5).reduce((acc, l) => acc + (l.retrieval_latency_ms || 0), 0) / 5;
         const anomalyCount = logs.filter(l => l.anomaly_score && l.anomaly_score > 0.6).length;
+        const stuckItems = queue.filter(q => q.status === 'failed' && (q.retryCount ?? 0) >= 3);
 
-        setHealth(prev => ({
-            ...prev,
-            storage_pressure: usage.percent,
-            avg_latency: recentLatency,
-            queue_depth: queue.length,
-            anomalies_detected: anomalyCount,
-            status: (usage.percent > 90 || recentLatency > 2000 || anomalyCount > 3) ? 'degraded' : (prev.status === 'safe_mode' ? 'safe_mode' : 'nominal')
-        }));
+        let nextStatus: SystemHealth['status'] = 'nominal';
+        setHealth(prev => {
+            nextStatus = (usage.percent > 90 || recentLatency > 2000 || anomalyCount > 3)
+                ? 'degraded'
+                : (prev.status === 'safe_mode' ? 'safe_mode' : 'nominal');
+
+            return {
+                ...prev,
+                storage_pressure: usage.percent,
+                avg_latency: recentLatency,
+                queue_depth: queue.length,
+                anomalies_detected: anomalyCount,
+                status: nextStatus
+            };
+        });
+
+        const newWarnings: string[] = [];
+        if (!isApiConfigured()) newWarnings.push('Gemini API key missing. Cloud augmentation is disabled.');
+        if (!navigator.onLine) newWarnings.push('Offline mode active. Requests will stay local.');
+        if (stuckItems.length > 0) newWarnings.push('Background queue has failed items. Consider clearing stuck tasks.');
+        if (usage.percent > 90) newWarnings.push('Storage nearly full. In-flight data may be evicted.');
+        if (nextStatus === 'safe_mode') newWarnings.push('Safe mode engaged. Storage writes paused.');
+
+        setWarnings(prev => Array.from(new Set([...(prev || []), ...newWarnings])));
      }, 10000);
 
      return () => {
@@ -131,6 +151,19 @@ const App: React.FC = () => {
                     <span className="text-[10px] font-bold uppercase tracking-widest">Safe Mode: Storage IO Restricted</span>
                 </div>
                 <button onClick={() => window.location.reload()} className="text-[10px] font-bold bg-white/20 px-3 py-1 rounded">Re-Boot</button>
+            </div>
+        )}
+
+        {warnings.length > 0 && (
+            <div className="absolute top-4 left-4 max-w-md bg-slate-900/80 border border-amber-500/40 rounded-2xl shadow-lg p-4 space-y-2 text-amber-100 text-sm z-40 backdrop-blur-md">
+                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-amber-200">
+                    <AlertTriangle className="w-3 h-3" /> Reliability Notices
+                </div>
+                <ul className="space-y-1 list-disc list-inside text-amber-100/90">
+                    {warnings.slice(-4).map((w, idx) => (
+                        <li key={`${w}-${idx}`}>{w}</li>
+                    ))}
+                </ul>
             </div>
         )}
 

@@ -50,6 +50,73 @@ const Settings: React.FC = () => {
         <p className="text-slate-400 mt-1">Advanced cognitive tiers and synchronization parameters.</p>
       </header>
 
+      {/* ORIN / LOCAL RUNTIME */}
+      <div className="bg-slate-900/50 border border-slate-800 rounded-3xl p-8 space-y-6">
+          <div className="flex items-center justify-between">
+              <div>
+                  <h3 className="font-bold text-slate-100">NVIDIA Orin / Local Models</h3>
+                  <p className="text-[11px] text-slate-500">Prefer the Orin 8GB board for inference and keep Gemini as optional fallback.</p>
+              </div>
+              <div className="flex gap-2">
+                  <button
+                    onClick={() => setSettings({ ...settings, provider: 'local', orinMode: true, cloud_disabled: true })}
+                    className={`px-4 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest border ${settings.provider === 'local' ? 'bg-emerald-600 text-white border-emerald-400' : 'bg-slate-800 text-slate-300 border-slate-700'}`}
+                  >
+                      Local Only
+                  </button>
+                  <button
+                    onClick={() => setSettings({ ...settings, provider: 'gemini', orinMode: false, cloud_disabled: false })}
+                    className={`px-4 py-2 rounded-xl text-[10px] font-bold uppercase tracking-widest border ${settings.provider === 'gemini' ? 'bg-indigo-600 text-white border-indigo-400' : 'bg-slate-800 text-slate-300 border-slate-700'}`}
+                  >
+                      Gemini Cloud
+                  </button>
+              </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase">Local LLM Endpoint (Mistral/Triton)</label>
+                  <input
+                    type="text"
+                    value={settings.local_llm_endpoint || ''}
+                    onChange={e => setSettings({ ...settings, local_llm_endpoint: e.target.value })}
+                    className="w-full bg-slate-800/50 border border-slate-700 rounded-xl p-3 text-xs outline-none text-slate-300"
+                    placeholder="http://orin:8000/generate"
+                  />
+              </div>
+              <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase">Local Model Name</label>
+                  <input
+                    type="text"
+                    value={settings.local_llm_model || ''}
+                    onChange={e => setSettings({ ...settings, local_llm_model: e.target.value })}
+                    className="w-full bg-slate-800/50 border border-slate-700 rounded-xl p-3 text-xs outline-none text-slate-300"
+                    placeholder="mistral-3b-instruct"
+                  />
+              </div>
+              <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase">Local Whisper/Transcription Endpoint</label>
+                  <input
+                    type="text"
+                    value={settings.local_transcription_endpoint || ''}
+                    onChange={e => setSettings({ ...settings, local_transcription_endpoint: e.target.value })}
+                    className="w-full bg-slate-800/50 border border-slate-700 rounded-xl p-3 text-xs outline-none text-slate-300"
+                    placeholder="http://orin:8000/transcribe"
+                  />
+              </div>
+              <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase">Local API Key (optional)</label>
+                  <input
+                    type="password"
+                    value={settings.local_api_key || ''}
+                    onChange={e => setSettings({ ...settings, local_api_key: e.target.value })}
+                    className="w-full bg-slate-800/50 border border-slate-700 rounded-xl p-3 text-xs outline-none text-slate-300"
+                    placeholder="Bearer secret for local gateway"
+                  />
+              </div>
+          </div>
+      </div>
+
       {/* CLUSTER SELECTION */}
       <div className="bg-slate-900/50 border border-slate-800 rounded-3xl p-8 space-y-6">
           <h3 className="font-bold text-slate-100 flex items-center gap-2">

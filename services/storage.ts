@@ -19,7 +19,46 @@ const STORAGE_KEYS = {
   DECISION_LOGS: 'cliper_decision_logs'
 };
 
-const storage = window.sessionStorage; 
+type StorageAdapter = {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+  removeItem: (key: string) => void;
+  clear: () => void;
+  keys: () => string[];
+};
+
+const memoryFallback: Record<string, string> = {};
+
+let storageMode: 'session' | 'memory' = 'session';
+
+const createStorageAdapter = (): StorageAdapter => {
+  try {
+    const sess = window.sessionStorage;
+    const probeKey = '__cliper_probe__';
+    sess.setItem(probeKey, 'ok');
+    sess.removeItem(probeKey);
+
+    return {
+      getItem: (key: string) => sess.getItem(key),
+      setItem: (key: string, value: string) => sess.setItem(key, value),
+      removeItem: (key: string) => sess.removeItem(key),
+      clear: () => sess.clear(),
+      keys: () => Array.from({ length: sess.length }).map((_, idx) => sess.key(idx) || '')
+    };
+  } catch (e) {
+    console.warn('[Cliper] Falling back to in-memory storage. SessionStorage unavailable.', e);
+    storageMode = 'memory';
+    return {
+      getItem: (key: string) => memoryFallback[key] ?? null,
+      setItem: (key: string, value: string) => { memoryFallback[key] = value; },
+      removeItem: (key: string) => { delete memoryFallback[key]; },
+      clear: () => { Object.keys(memoryFallback).forEach(k => delete memoryFallback[k]); },
+      keys: () => Object.keys(memoryFallback)
+    };
+  }
+};
+
+const storage: StorageAdapter = createStorageAdapter();
 
 const save = async (key: string, data: any) => {
     try {
@@ -46,10 +85,14 @@ export const initializeStorage = async () => {
 
 export const getSettings = (): LLMSettings => {
   return load<LLMSettings>(STORAGE_KEYS.SETTINGS, {
-    provider: 'gemini', 
+    provider: 'gemini',
     executionMode: 'auto',
     ollamaUrl: '',
-    ollamaModel: '', 
+    ollamaModel: '',
+    local_llm_endpoint: 'http://localhost:8000/generate',
+    local_llm_model: 'mistral',
+    local_transcription_endpoint: 'http://localhost:8000/transcribe',
+    local_api_key: '',
     mcpEnabled: false,
     mcpEndpoint: '',
     enableSimulation: false,
@@ -211,7 +254,19 @@ export const updateQueueItem = (id: string, updates: any) => save(STORAGE_KEYS.Q
 export const getDecisionLogs = () => load<DecisionLog[]>(STORAGE_KEYS.DECISION_LOGS, []);
 export const saveDecisionLog = (log: DecisionLog) => save(STORAGE_KEYS.DECISION_LOGS, [log, ...getDecisionLogs()].slice(0, 50));
 
-export const getStorageUsage = () => ({ usedKB: 0, limitKB: 5000, percent: 0 });
+export const getStorageUsage = () => {
+  const keys = storage.keys();
+  const usedKB = keys.reduce((acc, key) => {
+    const value = storage.getItem(key) || '';
+    return acc + (key.length + value.length) * 2 / 1024; // UTF-16 bytes -> KB
+  }, 0);
+
+  // SessionStorage nominal quota ~5MB; keep conservative headroom for fallback memory mode too.
+  const limitKB = 5000;
+  const percent = Math.min(100, Math.round((usedKB / limitKB) * 100));
+
+  return { usedKB, limitKB, percent };
+};
 
 export const runSystemBootCheck = () => {
   const errors: string[] = [];
@@ -221,6 +276,16 @@ export const runSystemBootCheck = () => {
   } catch (e) {
       errors.push("Volatile storage subsystem is unreachable.");
   }
+
+  const usage = getStorageUsage();
+  if (usage.percent >= 90) {
+      errors.push(`Storage pressure high (${usage.percent}%). Aging logs will purge automatically.`);
+  }
+
+  if (storageMode === 'memory') {
+      errors.push('Operating in RAM fallback mode. Data will be lost on refresh.');
+  }
+
   return errors;
 };
 
@@ -270,4 +335,12 @@ export const addSmartDevice = (device: Partial<SmartDevice>) => {
 export const updateSmartDevice = (id: string, updates: Partial<SmartDevice>) => save(STORAGE_KEYS.SMART_DEVICES, getSmartDevices().map(d => d.id === id ? { ...d, ...updates } : d));
 export const deleteSmartDevice = (id: string) => save(STORAGE_KEYS.SMART_DEVICES, getSmartDevices().filter(d => d.id !== id));
 
-export const purgeOldDecisionLogs = () => {};
+export const purgeOldDecisionLogs = () => {
+  const settings = getSettings();
+  const ttlMs = (settings.decision_log_ttl_days ?? 1) * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - ttlMs;
+  const filtered = getDecisionLogs().filter(log => log.timestamp >= cutoff);
+  if (filtered.length !== getDecisionLogs().length) {
+    save(STORAGE_KEYS.DECISION_LOGS, filtered);
+  }
+};

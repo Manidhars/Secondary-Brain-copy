@@ -4,7 +4,13 @@ import { getSettings, getUserProfile, trackMemoryAccess, saveDecisionLog, getMem
 import { localTranscribe } from './whisper';
 
 export { localTranscribe };
-export const isApiConfigured = () => !!process.env.API_KEY;
+export const isApiConfigured = () => {
+    const settings = getSettings();
+    if (settings.provider === 'local' || settings.orinMode || settings.cloud_disabled) {
+        return !!settings.local_llm_endpoint;
+    }
+    return !!process.env.API_KEY;
+};
 
 // Fix: Use ai.models.generateContent with simplified contents string following SDK best practices
 export const diarizeTranscription = async (text: string): Promise<TranscriptSegment[]> => {
@@ -61,6 +67,49 @@ const memoryTools: Tool = {
       }
     }
   ]
+};
+
+const callLocalLLM = async (
+    payload: {
+        prompt: string;
+        history: { role: string; content: string }[];
+        context: string;
+        model: string;
+        mode: 'active' | 'observer';
+        endpoint?: string;
+        apiKey?: string;
+    }
+) => {
+    if (!payload.endpoint) {
+        throw new Error('Local LLM endpoint not configured');
+    }
+
+    const response = await fetch(payload.endpoint, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(payload.apiKey ? { Authorization: `Bearer ${payload.apiKey}` } : {})
+        },
+        body: JSON.stringify({
+            prompt: payload.prompt,
+            history: payload.history,
+            context: payload.context,
+            model: payload.model,
+            mode: payload.mode
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`Local LLM unreachable (${response.status})`);
+    }
+
+    const data = await response.json().catch(() => ({}));
+    return {
+        reply: data.reply || data.output || data.text,
+        explanation: data.explanation || data.reasoning,
+        citations: data.citations || [],
+        assumptions: data.assumptions || []
+    };
 };
 
 // Fix: Use ai.models.generateContent with simplified contents string
@@ -139,42 +188,57 @@ export const consultBrain = async (
   }
   `;
 
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const chat = ai.chats.create({
-    model: 'gemini-3-flash-preview',
-    config: { 
-      systemInstruction: systemPrompt,
-      responseMimeType: "application/json",
-      tools: isObserver || systemStatus === 'safe_mode' ? [] : [memoryTools],
-      thinkingConfig: { thinkingBudget: isThrottled ? 0 : 2000 }
-    },
-    history: history.map(h => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: h.content }] }))
-  });
+  const useLocal = settings.provider === 'local' || settings.orinMode || settings.cloud_disabled;
+  let parsed: any = { reply: "I encountered an error processing that request." };
 
-  let response = await chat.sendMessage({ message: currentMessage });
-  
-  // Fix: Handle function calls explicitly and correctly
-  if (response.functionCalls && response.functionCalls.length > 0) {
-      for (const fc of response.functionCalls) {
-          if (fc.name === 'modify_memory') {
-              updateMemory(fc.args.memory_id as string, { 
-                  content: fc.args.new_content as string, 
-                  justification: fc.args.reason as string 
-              });
+  if (useLocal) {
+      const local = await callLocalLLM({
+          prompt: systemPrompt + `\n\nUser: ${currentMessage}`,
+          history,
+          context: contextStr,
+          model: settings.local_llm_model || 'mistral',
+          mode: isObserver ? 'observer' : 'active',
+          endpoint: settings.local_llm_endpoint,
+          apiKey: settings.local_api_key
+      });
+      parsed = local;
+  } else {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const chat = ai.chats.create({
+        model: 'gemini-3-flash-preview',
+        config: {
+          systemInstruction: systemPrompt,
+          responseMimeType: "application/json",
+          tools: isObserver || systemStatus === 'safe_mode' ? [] : [memoryTools],
+          thinkingConfig: { thinkingBudget: isThrottled ? 0 : 2000 }
+        },
+        history: history.map(h => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: h.content }] }))
+      });
+
+      let response = await chat.sendMessage({ message: currentMessage });
+
+      // Fix: Handle function calls explicitly and correctly
+      if (response.functionCalls && response.functionCalls.length > 0) {
+          for (const fc of response.functionCalls) {
+              if (fc.name === 'modify_memory') {
+                  updateMemory(fc.args.memory_id as string, {
+                      content: fc.args.new_content as string,
+                      justification: fc.args.reason as string
+                  });
+              }
+          }
+          // Re-query for final text response if model didn't provide it
+          if (!response.text) {
+              response = await chat.sendMessage({ message: "Processed tool. Please provide final response in the required JSON format." });
           }
       }
-      // Re-query for final text response if model didn't provide it
-      if (!response.text) {
-          response = await chat.sendMessage({ message: "Processed tool. Please provide final response in the required JSON format." });
-      }
-  }
 
-  let parsed: any = { reply: "I encountered an error processing that request." };
-  try {
-      parsed = JSON.parse(response.text || "{}");
-  } catch (e) {
-      console.warn("[Cliper] Gemini returned non-JSON text. Using fallback.", response.text);
-      parsed.reply = response.text || parsed.reply;
+      try {
+          parsed = JSON.parse(response.text || "{}");
+      } catch (e) {
+          console.warn("[Cliper] Gemini returned non-JSON text. Using fallback.", response.text);
+          parsed.reply = response.text || parsed.reply;
+      }
   }
   
   saveDecisionLog({
@@ -184,7 +248,7 @@ export const consultBrain = async (
     memories_considered: searchSpace.length,
     memories_injected: candidates.length,
     injected_ids: candidates.map(c => c.id),
-    cloud_called: true,
+    cloud_called: !useLocal,
     decision_reason: `Recall depth: ${candidateLimit}. Mode: ${isObserver ? 'Observer' : 'Active'}`,
     retrieval_latency_ms: Date.now() - startTime,
     cognitive_load: cognitiveLoad,

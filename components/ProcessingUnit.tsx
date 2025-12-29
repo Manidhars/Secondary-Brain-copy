@@ -19,9 +19,10 @@ const ProcessingUnit: React.FC = () => {
     window.addEventListener('keydown', handleActivity);
     
     const maintenanceInterval = setInterval(() => {
-        if (isSafeMode) return; 
+        if (isSafeMode) return;
 
         const settings = getSettings();
+        purgeOldDecisionLogs();
         const now = Date.now();
         const lastMaintenance = settings.last_maintenance_at ? new Date(settings.last_maintenance_at).getTime() : 0;
         const oneDay = 24 * 60 * 60 * 1000;

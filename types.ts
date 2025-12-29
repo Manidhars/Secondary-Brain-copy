@@ -3,7 +3,7 @@ export type MemoryType = 'fact' | 'decision' | 'preference' | 'constraint' | 'ta
 export type MemoryDomain = 'work' | 'personal' | 'home' | 'health' | 'finance' | 'system' | 'general';
 export type MemoryStatus = 'active' | 'completed' | 'archived' | 'decaying' | 'deprecated' | 'superseded' | 'cold_storage' | 'contradictory';
 export type RecallPriority = 'high' | 'normal' | 'low';
-export type LLMProvider = 'gemini' | 'ollama' | 'anthropic';
+export type LLMProvider = 'gemini' | 'ollama' | 'anthropic' | 'local';
 export type ConnectionProtocol = 'wired' | 'wifi' | 'ble' | 'cloud';
 export type MemoryCluster = 'main' | 'experimental';
 
@@ -72,6 +72,10 @@ export interface LLMSettings {
   executionMode: 'auto' | 'manual';
   ollamaUrl: string;
   ollamaModel: string;
+  local_llm_endpoint?: string;
+  local_llm_model?: string;
+  local_transcription_endpoint?: string;
+  local_api_key?: string;
   mcpEnabled: boolean;
   mcpEndpoint: string;
   enableSimulation: boolean;

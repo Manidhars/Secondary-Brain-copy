@@ -1,5 +1,6 @@
 
 import { pipeline, env } from '@xenova/transformers';
+import { getSettings } from './storage';
 
 // Configuration to load models from CDN instead of local filesystem
 // This is required for browser-based execution via ESM
@@ -43,11 +44,29 @@ const convertBlobToAudioData = async (blob: Blob): Promise<Float32Array> => {
 
 // Transcribe audio using the local in-browser model.
 export const localTranscribe = async (audioBlob: Blob): Promise<string> => {
+  const settings = getSettings();
+  if (settings.local_transcription_endpoint) {
+      const form = new FormData();
+      form.append('file', audioBlob, 'audio.webm');
+      const resp = await fetch(settings.local_transcription_endpoint, {
+          method: 'POST',
+          headers: {
+            ...(settings.local_api_key ? { Authorization: `Bearer ${settings.local_api_key}` } : {})
+          },
+          body: form
+      });
+
+      if (resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          if (data.text) return data.text;
+      }
+  }
+
   if (!transcriber) {
     // Attempt auto-load if not ready
     await loadWhisperModel();
   }
-  
+
   if (!transcriber) {
       throw new Error("Local Whisper model failed to initialize.");
   }
