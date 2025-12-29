@@ -1,0 +1,8 @@
+{
+  "name": "Copy of Secondary Brain 2",
+  "description": "A privacy-focused, cloud-hybrid AI assistant dashboard. Features memory ingestion, smart entity extraction, dynamic reminders, and context-aware chat using the Gemini API.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
