@@ -18,7 +18,8 @@ export interface Memory {
   salience: number;
   trust_score: number;
   confidence_history: number[];
-  status: MemoryStatus; 
+  strength?: number;
+  status: MemoryStatus;
   recall_priority: RecallPriority;
   supersedes: string | null;
   source_hash: string; 
@@ -151,6 +152,8 @@ export interface Person {
   facts: PersonFact[];
   consent_given: boolean; // New: Governance
   lastUpdated: string;
+  identityConfidence?: number;
+  mergedInto?: string;
 }
 
 export interface Reminder {
@@ -207,6 +210,8 @@ export interface PendingPersonDecision {
   matchedPersonId?: string;
   fact: string;
   createdAt: string;
+  candidates?: { personId: string; confidence: number; evidence: string[] }[];
+  lastPrompt?: string;
 }
 
 export interface TranscriptionLog {

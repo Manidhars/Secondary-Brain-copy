@@ -19,10 +19,344 @@ const STORAGE_KEYS = {
   ROOMS: 'cliper_smart_rooms',
   DECISION_LOGS: 'cliper_decision_logs',
   PENDING_PROJECT: 'cliper_pending_project_decision',
-  PENDING_PERSON: 'cliper_pending_person_decision'
+  PENDING_PERSON: 'cliper_pending_person_decision',
+  MEMORY_EVENTS: 'cliper_memory_events',
+  IDENTITY_EVENTS: 'cliper_identity_events',
+  BIAS_HISTORY: 'cliper_bias_history',
+  CONCERN_TRACES: 'cliper_concern_traces'
 };
 
-const storage = window.sessionStorage; 
+type MemoryAdjustmentEvent = {
+  timestamp: number;
+  memoryId: string;
+  delta: number;
+  strengthAfter: number;
+  reason: string;
+};
+
+type IdentityAdjustmentEvent = {
+  timestamp: number;
+  personId: string;
+  delta: number;
+  confidenceAfter: number;
+  reason: string;
+  snapshot?: { target?: Person; source?: Person };
+  mergeIds?: { targetId: string; sourceId: string };
+};
+
+type BiasDriftEntry = {
+  timestamp: number;
+  clarityThresholdBias: number;
+  ambiguityToleranceBias: number;
+  questioningBias: number;
+  notes?: string[];
+};
+
+type ConcernTrace = {
+  description: string;
+  weight: number;
+  lastUpdated: number;
+  evidence: string[];
+};
+
+const storage = window.sessionStorage;
+
+const clampStrength = (value: number) => Math.min(1.25, Math.max(0.05, value));
+const clampIdentityConfidence = (value: number) => Math.min(0.98, Math.max(0.05, value));
+const clampConcernWeight = (value: number) => Math.min(1.25, Math.max(0.05, value));
+
+const getMemoryEvents = (): MemoryAdjustmentEvent[] => load<MemoryAdjustmentEvent[]>(STORAGE_KEYS.MEMORY_EVENTS, []);
+const getIdentityEvents = (): IdentityAdjustmentEvent[] => load<IdentityAdjustmentEvent[]>(STORAGE_KEYS.IDENTITY_EVENTS, []);
+const getBiasHistory = (): BiasDriftEntry[] => load<BiasDriftEntry[]>(STORAGE_KEYS.BIAS_HISTORY, []);
+const getStoredConcernTraces = (): ConcernTrace[] => load<ConcernTrace[]>(STORAGE_KEYS.CONCERN_TRACES, []);
+
+const recordMemoryEvent = (event: MemoryAdjustmentEvent) => {
+  const events = [event, ...getMemoryEvents()].slice(0, 200);
+  save(STORAGE_KEYS.MEMORY_EVENTS, events);
+  console.info(
+    `[Cliper] Memory ${event.memoryId} strength adjusted by ${event.delta.toFixed(3)} to ${event.strengthAfter.toFixed(
+      3
+    )} (${event.reason}).`
+  );
+};
+
+const recordIdentityEvent = (event: IdentityAdjustmentEvent) => {
+  const events = [event, ...getIdentityEvents()].slice(0, 200);
+  save(STORAGE_KEYS.IDENTITY_EVENTS, events);
+  console.info(
+    `[Cliper] Identity ${event.personId} confidence adjusted by ${event.delta.toFixed(3)} to ${event.confidenceAfter.toFixed(
+      3
+    )} (${event.reason}).`
+  );
+};
+
+export const recordBiasDriftSnapshot = (entry: BiasDriftEntry) => {
+  const history = [entry, ...getBiasHistory()].slice(0, 200);
+  save(STORAGE_KEYS.BIAS_HISTORY, history);
+};
+
+const saveConcernTraces = (traces: ConcernTrace[]) => {
+  save(STORAGE_KEYS.CONCERN_TRACES, traces.slice(0, 12));
+};
+
+const tokenize = (text: string) =>
+  text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+
+const normalizeTheme = (content: string) => {
+  const tokens = tokenize(content).filter(t => t.length > 3);
+  if (tokens.length === 0) return content.toLowerCase();
+  return tokens.slice(0, 6).join(' ');
+};
+
+const applyConcernDecay = (traces: ConcernTrace[], now = Date.now()) => {
+  let changed = false;
+  traces.forEach((trace, idx) => {
+    const days = Math.max(0, (now - trace.lastUpdated) / 86_400_000);
+    if (days < 0.1) return;
+    const decay = Math.min(0.08, days * 0.01);
+    const next = clampConcernWeight(trace.weight - decay);
+    if (Math.abs(next - trace.weight) < 0.0005) return;
+    traces[idx] = { ...trace, weight: next };
+    changed = true;
+  });
+  if (changed) saveConcernTraces(traces);
+  return traces;
+};
+
+const mergeConcernTraces = (existing: ConcernTrace[], updates: ConcernTrace[]) => {
+  const merged = [...existing];
+  updates.forEach(update => {
+    const key = normalizeTheme(update.description);
+    const idx = merged.findIndex(t => normalizeTheme(t.description) === key);
+    if (idx === -1) {
+      merged.push(update);
+      return;
+    }
+    const blendedWeight = clampConcernWeight((merged[idx].weight * 0.6) + (update.weight * 0.4));
+    merged[idx] = {
+      description: merged[idx].description,
+      weight: blendedWeight,
+      lastUpdated: update.lastUpdated,
+      evidence: Array.from(new Set([...merged[idx].evidence, ...update.evidence])).slice(0, 6)
+    };
+  });
+  return merged
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, 12);
+};
+
+const themeFromMemory = (memory: Memory) => {
+  const topic = memory.metadata?.topic || '';
+  const base = topic || memory.content.slice(0, 140);
+  return base.trim();
+};
+
+const gatherConcernSignals = (now = Date.now()) => {
+  const memories = getMemories();
+  const people = getPeople();
+  const memoryEvents = getMemoryEvents();
+  const identityEvents = getIdentityEvents();
+  const biasHistory = getBiasHistory();
+
+  const updates: ConcernTrace[] = [];
+
+  memoryEvents.slice(0, 50).forEach(event => {
+    const memory = memories.find(m => m.id === event.memoryId);
+    if (!memory) return;
+    const direction = event.delta >= 0 ? 1 : -1;
+    const magnitude = Math.min(0.18, Math.abs(event.delta) * 4);
+    const theme = themeFromMemory(memory);
+    updates.push({
+      description: theme,
+      weight: clampConcernWeight(0.08 * direction + magnitude),
+      lastUpdated: now,
+      evidence: [event.reason]
+    });
+  });
+
+  identityEvents.slice(0, 40).forEach(event => {
+    const person = people.find(p => p.id === event.personId);
+    if (!person) return;
+    const direction = event.delta >= 0 ? 1 : -1;
+    const theme = `${person.name} consistency and relationships`;
+    const magnitude = Math.min(0.12, Math.abs(event.delta) * 2 + (event.mergeIds ? 0.06 : 0));
+    updates.push({
+      description: theme,
+      weight: clampConcernWeight(0.06 * direction + magnitude),
+      lastUpdated: now,
+      evidence: [event.reason]
+    });
+  });
+
+  if (biasHistory.length >= 2) {
+    const latest = biasHistory[0];
+    const previous = biasHistory[1];
+    const clarityDrift = latest.clarityThresholdBias - previous.clarityThresholdBias;
+    const ambiguityDrift = latest.ambiguityToleranceBias - previous.ambiguityToleranceBias;
+    const cautionTheme = clarityDrift > 0.01 ? 'Protecting clarity before committing' : null;
+    const opennessTheme = ambiguityDrift > 0.01 ? 'Staying open to loose context' : null;
+    if (cautionTheme) {
+      updates.push({ description: cautionTheme, weight: clampConcernWeight(0.08 + clarityDrift), lastUpdated: now, evidence: latest.notes || [] });
+    }
+    if (opennessTheme) {
+      updates.push({ description: opennessTheme, weight: clampConcernWeight(0.08 + ambiguityDrift), lastUpdated: now, evidence: latest.notes || [] });
+    }
+  }
+
+  return updates;
+};
+
+export const deriveConcernThemes = (now = Date.now()) => {
+  const existing = applyConcernDecay(getStoredConcernTraces(), now);
+  const signals = gatherConcernSignals(now);
+  if (signals.length === 0) return existing;
+  const merged = mergeConcernTraces(existing, signals);
+  saveConcernTraces(merged);
+  return merged;
+};
+
+export const scoreConcernAlignment = (text: string, traces: ConcernTrace[] = deriveConcernThemes()) => {
+  if (traces.length === 0) return { alignment: 0, topConcern: null as ConcernTrace | null };
+  const tokens = tokenize(text);
+  if (tokens.length === 0) return { alignment: 0, topConcern: null };
+  let best: ConcernTrace | null = null;
+  let bestScore = 0;
+  traces.forEach(trace => {
+    const themeTokens = tokenize(trace.description);
+    if (themeTokens.length === 0) return;
+    const overlap = themeTokens.filter(t => tokens.includes(t));
+    const score = Math.min(1, (overlap.length * 0.1) + trace.weight * 0.1);
+    if (score > bestScore) {
+      bestScore = score;
+      best = trace;
+    }
+  });
+  return { alignment: bestScore, topConcern: best };
+};
+
+export const reinforceConcernTrace = (description: string, evidence: string) => {
+  const traces = deriveConcernThemes();
+  const normalized = normalizeTheme(description);
+  const idx = traces.findIndex(t => normalizeTheme(t.description) === normalized);
+  const now = Date.now();
+  const reinforcement = clampConcernWeight(0.06);
+  if (idx === -1) {
+    traces.push({ description, weight: reinforcement, lastUpdated: now, evidence: [evidence] });
+  } else {
+    traces[idx] = {
+      ...traces[idx],
+      weight: clampConcernWeight(traces[idx].weight + reinforcement),
+      lastUpdated: now,
+      evidence: Array.from(new Set([evidence, ...traces[idx].evidence])).slice(0, 6)
+    };
+  }
+  saveConcernTraces(traces.sort((a, b) => b.weight - a.weight));
+};
+
+const applyIdentityConfidenceDecay = (people: Person[], now = Date.now()) => {
+  let changed = false;
+
+  people.forEach((person, idx) => {
+    const prior = deriveIdentityConfidence(person);
+    const lastTouch = new Date(person.lastUpdated || now).getTime();
+    const days = Math.max(0, (now - lastTouch) / 86_400_000);
+
+    const ambientDecay = days * 0.002; // gentle drift downward
+    const prolongedDecay = days > 30 ? (days - 30) * 0.004 : 0; // speed up only after long inactivity
+    const totalDecay = ambientDecay + prolongedDecay;
+    if (totalDecay < 0.0005) return;
+
+    const next = clampIdentityConfidence(prior - totalDecay);
+    if (Math.abs(next - prior) < 0.0005) return;
+
+    people[idx] = { ...person, identityConfidence: next };
+    changed = true;
+    recordIdentityEvent({
+      timestamp: now,
+      personId: person.id,
+      delta: next - prior,
+      confidenceAfter: next,
+      reason: prolongedDecay > 0 ? 'Identity confidence decayed after long inactivity' : 'Identity confidence gently decayed'
+    });
+  });
+
+  if (changed) save(STORAGE_KEYS.PEOPLE, people);
+  return people;
+};
+
+const deriveBaseStrength = (memory: Memory) => {
+  if (typeof memory.strength === 'number') return memory.strength;
+  const salienceSeed = typeof memory.salience === 'number' ? memory.salience : 0.5;
+  return clampStrength(0.5 + salienceSeed * 0.3);
+};
+
+const deriveIdentityConfidence = (person: Person) => {
+  if (typeof person.identityConfidence === 'number') return clampIdentityConfidence(person.identityConfidence);
+  const factSignal = Math.min(0.2, (person.facts?.length || 0) * 0.02);
+  return clampIdentityConfidence(0.55 + factSignal);
+};
+
+const applyStrengthDelta = (memory: Memory, delta: number, reason: string, now = Date.now()) => {
+  const prior = deriveBaseStrength(memory);
+  const updated = clampStrength(prior + delta);
+  if (Math.abs(updated - prior) < 0.0005) {
+    memory.strength = prior;
+    return prior;
+  }
+  memory.strength = updated;
+  recordMemoryEvent({ timestamp: now, memoryId: memory.id, delta: updated - prior, strengthAfter: updated, reason });
+  return updated;
+};
+
+const applyDecayToMemories = (memories: Memory[], now = Date.now()) => {
+  let changed = false;
+  const concerns = deriveConcernThemes(now);
+
+  memories.forEach((memory, idx) => {
+    const baseStrength = deriveBaseStrength(memory);
+    const lastTouch = new Date(memory.lastAccessedAt || memory.updatedAt || memory.createdAt || now).getTime();
+    const daysSinceAccess = Math.max(0, (now - lastTouch) / 86_400_000);
+
+    // Slow decay that accelerates with prolonged inactivity but never drops abruptly.
+    const gentleDecay = daysSinceAccess * 0.002; // ~0.02 over 10 days
+    const prolongedBoost = daysSinceAccess > 14 ? (daysSinceAccess - 14) * 0.003 : 0; // faster after two weeks idle
+    const totalDecay = gentleDecay + prolongedBoost;
+
+    const concernSignal = scoreConcernAlignment(
+      `${memory.content} ${memory.metadata?.topic || ''}`,
+      concerns
+    );
+    const decayModifier = concernSignal.alignment > 0 ? Math.max(0.35, 1 - concernSignal.alignment * 0.5) : 1;
+    const adjustedDecay = totalDecay * decayModifier;
+
+    const shouldDecay = adjustedDecay >= 0.001;
+    const nextStrength = shouldDecay ? clampStrength(baseStrength - adjustedDecay) : baseStrength;
+    if (nextStrength !== baseStrength || memory.strength !== baseStrength) {
+      memories[idx] = { ...memory, strength: nextStrength };
+      changed = true;
+      if (shouldDecay && nextStrength !== baseStrength) {
+        recordMemoryEvent({
+          timestamp: now,
+          memoryId: memory.id,
+          delta: nextStrength - baseStrength,
+          strengthAfter: nextStrength,
+          reason:
+            concernSignal.alignment > 0.15
+              ? `Decay softened by persistent concern: ${concernSignal.topConcern?.description || 'recurring theme'}`
+              : daysSinceAccess > 14
+                ? 'Prolonged inactivity decay'
+                : 'Ambient time decay'
+        });
+      }
+    }
+  });
+
+  if (changed) save(STORAGE_KEYS.MEMORIES, memories);
+  return memories;
+};
 
 const save = async (key: string, data: any) => {
     try {
@@ -73,7 +407,10 @@ export const getSettings = (): LLMSettings => {
 };
 
 export const saveSettings = (settings: LLMSettings) => save(STORAGE_KEYS.SETTINGS, settings);
-export const getMemories = (): Memory[] => load<Memory[]>(STORAGE_KEYS.MEMORIES, []);
+export const getMemories = (): Memory[] => {
+  const hydrated = load<Memory[]>(STORAGE_KEYS.MEMORIES, []).map(m => ({ ...m, strength: deriveBaseStrength(m) }));
+  return applyDecayToMemories(hydrated);
+};
 
 export const getPendingProjectDecision = (): PendingProjectDecision | null => {
   const stored = storage.getItem(STORAGE_KEYS.PENDING_PROJECT);
@@ -145,8 +482,9 @@ export const addMemory = (params: any): Memory | null => {
     createdAt: new Date().toISOString(),
     lastAccessedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    strength: clampStrength(params.strength ?? (0.6 + (params.salience ?? 0.8) * 0.15)),
     accessCount: 1,
-    isLocked: false, 
+    isLocked: false,
     isPendingApproval: params.isPendingApproval || false,
     isPinned: params.isPinned || false,
     justification: params.justification || "Session Insight",
@@ -171,7 +509,22 @@ export const updateMemory = (id: string, updates: Partial<Memory>) => {
   const memories = getMemories();
   const idx = memories.findIndex(m => m.id === id);
   if (idx !== -1) {
-    memories[idx] = { ...memories[idx], ...updates, updatedAt: new Date().toISOString() };
+    const now = Date.now();
+    const prior = memories[idx];
+    memories[idx] = { ...prior, ...updates, updatedAt: new Date(now).toISOString() };
+
+    const justificationSignals = [updates.justification, updates.metadata?.validation_reason].filter(Boolean).join(' ');
+    const appearsCorrected = /correction|contradict|fix|revise|update/i.test(justificationSignals);
+    const confidenceMoved =
+      typeof updates.confidence === 'number' && typeof prior.confidence === 'number'
+        ? updates.confidence - prior.confidence
+        : 0;
+
+    if (appearsCorrected || confidenceMoved < -0.05) {
+      applyStrengthDelta(memories[idx], -0.04, 'Memory corrected or contradicted', now);
+    } else if (confidenceMoved > 0.05) {
+      applyStrengthDelta(memories[idx], 0.02, 'Memory reinforced by confirmation', now);
+    }
     save(STORAGE_KEYS.MEMORIES, memories);
   }
 };
@@ -186,25 +539,174 @@ export const getMemoriesInFolder = (folderPrefix: string): Memory[] => {
   return getMemories().filter(m => (m.metadata?.folder || '').toLowerCase().startsWith(normalized));
 };
 
-export const trackMemoryAccess = (id: string) => {
+export const trackMemoryAccess = (id: string, reason: string = 'Retrieved for reasoning') => {
   const memories = getMemories();
   const idx = memories.findIndex(m => m.id === id);
   if (idx !== -1) {
+    const nowIso = new Date().toISOString();
     memories[idx].accessCount++;
-    memories[idx].lastAccessedAt = new Date().toISOString();
+    memories[idx].lastAccessedAt = nowIso;
+    applyStrengthDelta(memories[idx], 0.05, `${reason} (access count ${memories[idx].accessCount})`, Date.parse(nowIso));
     save(STORAGE_KEYS.MEMORIES, memories);
   }
 };
 
-export const getPeople = (): Person[] => load<Person[]>(STORAGE_KEYS.PEOPLE, []);
+export const registerMemoryIgnored = (ids: string[], reason: string = 'Surface ignored in retrieval') => {
+  if (ids.length === 0) return;
+  const memories = getMemories();
+  let changed = false;
+
+  ids.forEach(id => {
+    const idx = memories.findIndex(m => m.id === id);
+    if (idx !== -1) {
+      applyStrengthDelta(memories[idx], -0.01, `${reason} (access count ${memories[idx].accessCount})`);
+      changed = true;
+    }
+  });
+
+  if (changed) save(STORAGE_KEYS.MEMORIES, memories);
+};
+
+// Backwards compatibility shim: rely on the hydrated identity-aware getter
+export const getPeople = (): Person[] => {
+  const hydrated = load<Person[]>(STORAGE_KEYS.PEOPLE, []).map(p => ({ ...p, identityConfidence: deriveIdentityConfidence(p) }));
+  return applyIdentityConfidenceDecay(hydrated);
+};
+const adjustIdentityConfidence = (
+  people: Person[],
+  personId: string,
+  delta: number,
+  reason: string,
+  snapshot?: { target?: Person; source?: Person }
+) => {
+  const idx = people.findIndex(p => p.id === personId);
+  if (idx === -1) return null;
+  const prior = deriveIdentityConfidence(people[idx]);
+  const next = clampIdentityConfidence(prior + delta);
+  if (Math.abs(next - prior) < 0.0005) {
+    people[idx].identityConfidence = prior;
+    return prior;
+  }
+  people[idx].identityConfidence = next;
+  recordIdentityEvent({
+    timestamp: Date.now(),
+    personId,
+    delta: next - prior,
+    confidenceAfter: next,
+    reason,
+    snapshot
+  });
+  return next;
+};
+
+export const reinforceIdentity = (personId: string, reason: string) => {
+  const people = getPeople();
+  const updated = adjustIdentityConfidence(people, personId, 0.06, reason);
+  if (updated !== null) save(STORAGE_KEYS.PEOPLE, people);
+  return updated;
+};
+
+export const weakenIdentity = (personId: string, reason: string, sharp: boolean = false) => {
+  const people = getPeople();
+  const delta = sharp ? -0.25 : -0.08;
+  const updated = adjustIdentityConfidence(people, personId, delta, reason);
+  if (updated !== null) save(STORAGE_KEYS.PEOPLE, people);
+  return updated;
+};
+
+export const mergeIdentities = (targetId: string, sourceId: string, reason: string) => {
+  const people = getPeople();
+  const targetIdx = people.findIndex(p => p.id === targetId);
+  const sourceIdx = people.findIndex(p => p.id === sourceId);
+  if (targetIdx === -1 || sourceIdx === -1) return null;
+
+  const target = { ...people[targetIdx] };
+  const source = { ...people[sourceIdx] };
+  const snapshot = { target: { ...target }, source: { ...source } };
+
+  const mergedFacts = [...target.facts];
+  source.facts.forEach(f => {
+    if (!mergedFacts.some(existing => existing.content === f.content)) mergedFacts.push(f);
+  });
+
+  const priorTargetConfidence = deriveIdentityConfidence(target);
+  const priorSourceConfidence = deriveIdentityConfidence(source);
+  const averagedConfidence = clampIdentityConfidence((priorTargetConfidence + priorSourceConfidence) / 2 + 0.1);
+
+  people[targetIdx] = {
+    ...target,
+    facts: mergedFacts,
+    identityConfidence: averagedConfidence,
+    lastUpdated: new Date().toISOString()
+  };
+
+  people.splice(sourceIdx, 1);
+
+  recordIdentityEvent({
+    timestamp: Date.now(),
+    personId: targetId,
+    delta: averagedConfidence - priorTargetConfidence,
+    confidenceAfter: averagedConfidence,
+    reason,
+    snapshot,
+    mergeIds: { targetId, sourceId }
+  });
+
+  save(STORAGE_KEYS.PEOPLE, people);
+  return { mergedInto: people[targetIdx], snapshot };
+};
+
+export const splitIdentityHypothesis = (sourceId: string, newName: string, factStr: string, reason: string) => {
+  const people = getPeople();
+  const sourceIdx = people.findIndex(p => p.id === sourceId);
+  const now = new Date().toISOString();
+  let sourceSnapshot: Person | undefined;
+  if (sourceIdx !== -1) {
+    sourceSnapshot = { ...people[sourceIdx] };
+    adjustIdentityConfidence(people, sourceId, -0.12, `${reason} (source dampened)`, { target: sourceSnapshot });
+  }
+
+  const newPerson: Person = {
+    id: crypto.randomUUID(),
+    name: newName,
+    relation: 'Contact',
+    facts: [{ id: crypto.randomUUID(), content: factStr, source: 'user', timestamp: now }],
+    consent_given: true,
+    lastUpdated: now,
+    identityConfidence: clampIdentityConfidence(0.45),
+    mergedInto: undefined
+  };
+
+  people.push(newPerson);
+  recordIdentityEvent({
+    timestamp: Date.now(),
+    personId: newPerson.id,
+    delta: newPerson.identityConfidence || 0,
+    confidenceAfter: newPerson.identityConfidence || 0.45,
+    reason,
+    snapshot: { source: sourceSnapshot }
+  });
+  save(STORAGE_KEYS.PEOPLE, people);
+  return newPerson;
+};
+
 export const updatePerson = (name: string, factStr: string, relation: string = 'Contact') => {
   const people = getPeople();
   const idx = people.findIndex(p => p.name.toLowerCase() === name.toLowerCase());
   if (idx >= 0) {
     people[idx].facts.push({ id: crypto.randomUUID(), content: factStr, source: 'inferred', timestamp: new Date().toISOString() });
     people[idx].lastUpdated = new Date().toISOString();
+    adjustIdentityConfidence(people, people[idx].id, 0.04, 'New fact added without correction');
   } else {
-    people.push({ id: crypto.randomUUID(), name, relation, consent_given: true, facts: [{ id: crypto.randomUUID(), content: factStr, source: 'user', timestamp: new Date().toISOString() }], lastUpdated: new Date().toISOString() });
+    people.push({
+      id: crypto.randomUUID(),
+      name,
+      relation,
+      consent_given: true,
+      facts: [{ id: crypto.randomUUID(), content: factStr, source: 'user', timestamp: new Date().toISOString() }],
+      lastUpdated: new Date().toISOString(),
+      identityConfidence: clampIdentityConfidence(0.55)
+    });
   }
   save(STORAGE_KEYS.PEOPLE, people);
 };
@@ -224,6 +726,7 @@ export const addFactToPerson = (personId: string, content: string, source: 'user
   if (idx !== -1) {
     people[idx].facts.push({ id: crypto.randomUUID(), content, source, timestamp: new Date().toISOString() });
     people[idx].lastUpdated = new Date().toISOString();
+    adjustIdentityConfidence(people, personId, 0.05, 'Identity reinforced by new linked fact');
     save(STORAGE_KEYS.PEOPLE, people);
   }
 };
