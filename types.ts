@@ -3,7 +3,7 @@ export type MemoryType = 'fact' | 'decision' | 'preference' | 'constraint' | 'ta
 export type MemoryDomain = 'work' | 'personal' | 'home' | 'health' | 'finance' | 'system' | 'general';
 export type MemoryStatus = 'active' | 'completed' | 'archived' | 'decaying' | 'deprecated' | 'superseded' | 'cold_storage' | 'contradictory';
 export type RecallPriority = 'high' | 'normal' | 'low';
-export type LLMProvider = 'auto' | 'local' | 'gemini' | 'ollama' | 'anthropic' | 'mistral';
+export type LLMProvider = 'auto' | 'local';
 export type ConnectionProtocol = 'wired' | 'wifi' | 'ble' | 'cloud';
 export type MemoryCluster = 'main' | 'experimental';
 
@@ -193,6 +193,13 @@ export interface TranscriptSegment {
   speaker: string;
   text: string;
   timestamp: number;
+}
+
+export interface PendingProjectDecision {
+  projectName: string;
+  existingMemoryId?: string;
+  slug?: string;
+  createdAt: string;
 }
 
 export interface TranscriptionLog {
