@@ -21,9 +21,7 @@ const STORAGE_KEYS = {
   PENDING_PROJECT: 'cliper_pending_project_decision',
   PENDING_PERSON: 'cliper_pending_person_decision',
   MEMORY_EVENTS: 'cliper_memory_events',
-  IDENTITY_EVENTS: 'cliper_identity_events',
-  BIAS_HISTORY: 'cliper_bias_history',
-  CONCERN_TRACES: 'cliper_concern_traces'
+  IDENTITY_EVENTS: 'cliper_identity_events'
 };
 
 type MemoryAdjustmentEvent = {
@@ -44,31 +42,13 @@ type IdentityAdjustmentEvent = {
   mergeIds?: { targetId: string; sourceId: string };
 };
 
-type BiasDriftEntry = {
-  timestamp: number;
-  clarityThresholdBias: number;
-  ambiguityToleranceBias: number;
-  questioningBias: number;
-  notes?: string[];
-};
-
-type ConcernTrace = {
-  description: string;
-  weight: number;
-  lastUpdated: number;
-  evidence: string[];
-};
-
 const storage = window.sessionStorage;
 
 const clampStrength = (value: number) => Math.min(1.25, Math.max(0.05, value));
 const clampIdentityConfidence = (value: number) => Math.min(0.98, Math.max(0.05, value));
-const clampConcernWeight = (value: number) => Math.min(1.25, Math.max(0.05, value));
 
 const getMemoryEvents = (): MemoryAdjustmentEvent[] => load<MemoryAdjustmentEvent[]>(STORAGE_KEYS.MEMORY_EVENTS, []);
 const getIdentityEvents = (): IdentityAdjustmentEvent[] => load<IdentityAdjustmentEvent[]>(STORAGE_KEYS.IDENTITY_EVENTS, []);
-const getBiasHistory = (): BiasDriftEntry[] => load<BiasDriftEntry[]>(STORAGE_KEYS.BIAS_HISTORY, []);
-const getStoredConcernTraces = (): ConcernTrace[] => load<ConcernTrace[]>(STORAGE_KEYS.CONCERN_TRACES, []);
 
 const recordMemoryEvent = (event: MemoryAdjustmentEvent) => {
   const events = [event, ...getMemoryEvents()].slice(0, 200);
@@ -88,172 +68,6 @@ const recordIdentityEvent = (event: IdentityAdjustmentEvent) => {
       3
     )} (${event.reason}).`
   );
-};
-
-export const recordBiasDriftSnapshot = (entry: BiasDriftEntry) => {
-  const history = [entry, ...getBiasHistory()].slice(0, 200);
-  save(STORAGE_KEYS.BIAS_HISTORY, history);
-};
-
-const saveConcernTraces = (traces: ConcernTrace[]) => {
-  save(STORAGE_KEYS.CONCERN_TRACES, traces.slice(0, 12));
-};
-
-const tokenize = (text: string) =>
-  text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
-
-const normalizeTheme = (content: string) => {
-  const tokens = tokenize(content).filter(t => t.length > 3);
-  if (tokens.length === 0) return content.toLowerCase();
-  return tokens.slice(0, 6).join(' ');
-};
-
-const applyConcernDecay = (traces: ConcernTrace[], now = Date.now()) => {
-  let changed = false;
-  traces.forEach((trace, idx) => {
-    const days = Math.max(0, (now - trace.lastUpdated) / 86_400_000);
-    if (days < 0.1) return;
-    const decay = Math.min(0.08, days * 0.01);
-    const next = clampConcernWeight(trace.weight - decay);
-    if (Math.abs(next - trace.weight) < 0.0005) return;
-    traces[idx] = { ...trace, weight: next };
-    changed = true;
-  });
-  if (changed) saveConcernTraces(traces);
-  return traces;
-};
-
-const mergeConcernTraces = (existing: ConcernTrace[], updates: ConcernTrace[]) => {
-  const merged = [...existing];
-  updates.forEach(update => {
-    const key = normalizeTheme(update.description);
-    const idx = merged.findIndex(t => normalizeTheme(t.description) === key);
-    if (idx === -1) {
-      merged.push(update);
-      return;
-    }
-    const blendedWeight = clampConcernWeight((merged[idx].weight * 0.6) + (update.weight * 0.4));
-    merged[idx] = {
-      description: merged[idx].description,
-      weight: blendedWeight,
-      lastUpdated: update.lastUpdated,
-      evidence: Array.from(new Set([...merged[idx].evidence, ...update.evidence])).slice(0, 6)
-    };
-  });
-  return merged
-    .sort((a, b) => b.weight - a.weight)
-    .slice(0, 12);
-};
-
-const themeFromMemory = (memory: Memory) => {
-  const topic = memory.metadata?.topic || '';
-  const base = topic || memory.content.slice(0, 140);
-  return base.trim();
-};
-
-const gatherConcernSignals = (now = Date.now()) => {
-  const memories = getMemories();
-  const people = getPeople();
-  const memoryEvents = getMemoryEvents();
-  const identityEvents = getIdentityEvents();
-  const biasHistory = getBiasHistory();
-
-  const updates: ConcernTrace[] = [];
-
-  memoryEvents.slice(0, 50).forEach(event => {
-    const memory = memories.find(m => m.id === event.memoryId);
-    if (!memory) return;
-    const direction = event.delta >= 0 ? 1 : -1;
-    const magnitude = Math.min(0.18, Math.abs(event.delta) * 4);
-    const theme = themeFromMemory(memory);
-    updates.push({
-      description: theme,
-      weight: clampConcernWeight(0.08 * direction + magnitude),
-      lastUpdated: now,
-      evidence: [event.reason]
-    });
-  });
-
-  identityEvents.slice(0, 40).forEach(event => {
-    const person = people.find(p => p.id === event.personId);
-    if (!person) return;
-    const direction = event.delta >= 0 ? 1 : -1;
-    const theme = `${person.name} consistency and relationships`;
-    const magnitude = Math.min(0.12, Math.abs(event.delta) * 2 + (event.mergeIds ? 0.06 : 0));
-    updates.push({
-      description: theme,
-      weight: clampConcernWeight(0.06 * direction + magnitude),
-      lastUpdated: now,
-      evidence: [event.reason]
-    });
-  });
-
-  if (biasHistory.length >= 2) {
-    const latest = biasHistory[0];
-    const previous = biasHistory[1];
-    const clarityDrift = latest.clarityThresholdBias - previous.clarityThresholdBias;
-    const ambiguityDrift = latest.ambiguityToleranceBias - previous.ambiguityToleranceBias;
-    const cautionTheme = clarityDrift > 0.01 ? 'Protecting clarity before committing' : null;
-    const opennessTheme = ambiguityDrift > 0.01 ? 'Staying open to loose context' : null;
-    if (cautionTheme) {
-      updates.push({ description: cautionTheme, weight: clampConcernWeight(0.08 + clarityDrift), lastUpdated: now, evidence: latest.notes || [] });
-    }
-    if (opennessTheme) {
-      updates.push({ description: opennessTheme, weight: clampConcernWeight(0.08 + ambiguityDrift), lastUpdated: now, evidence: latest.notes || [] });
-    }
-  }
-
-  return updates;
-};
-
-export const deriveConcernThemes = (now = Date.now()) => {
-  const existing = applyConcernDecay(getStoredConcernTraces(), now);
-  const signals = gatherConcernSignals(now);
-  if (signals.length === 0) return existing;
-  const merged = mergeConcernTraces(existing, signals);
-  saveConcernTraces(merged);
-  return merged;
-};
-
-export const scoreConcernAlignment = (text: string, traces: ConcernTrace[] = deriveConcernThemes()) => {
-  if (traces.length === 0) return { alignment: 0, topConcern: null as ConcernTrace | null };
-  const tokens = tokenize(text);
-  if (tokens.length === 0) return { alignment: 0, topConcern: null };
-  let best: ConcernTrace | null = null;
-  let bestScore = 0;
-  traces.forEach(trace => {
-    const themeTokens = tokenize(trace.description);
-    if (themeTokens.length === 0) return;
-    const overlap = themeTokens.filter(t => tokens.includes(t));
-    const score = Math.min(1, (overlap.length * 0.1) + trace.weight * 0.1);
-    if (score > bestScore) {
-      bestScore = score;
-      best = trace;
-    }
-  });
-  return { alignment: bestScore, topConcern: best };
-};
-
-export const reinforceConcernTrace = (description: string, evidence: string) => {
-  const traces = deriveConcernThemes();
-  const normalized = normalizeTheme(description);
-  const idx = traces.findIndex(t => normalizeTheme(t.description) === normalized);
-  const now = Date.now();
-  const reinforcement = clampConcernWeight(0.06);
-  if (idx === -1) {
-    traces.push({ description, weight: reinforcement, lastUpdated: now, evidence: [evidence] });
-  } else {
-    traces[idx] = {
-      ...traces[idx],
-      weight: clampConcernWeight(traces[idx].weight + reinforcement),
-      lastUpdated: now,
-      evidence: Array.from(new Set([evidence, ...traces[idx].evidence])).slice(0, 6)
-    };
-  }
-  saveConcernTraces(traces.sort((a, b) => b.weight - a.weight));
 };
 
 const applyIdentityConfidenceDecay = (people: Person[], now = Date.now()) => {
@@ -313,7 +127,6 @@ const applyStrengthDelta = (memory: Memory, delta: number, reason: string, now =
 
 const applyDecayToMemories = (memories: Memory[], now = Date.now()) => {
   let changed = false;
-  const concerns = deriveConcernThemes(now);
 
   memories.forEach((memory, idx) => {
     const baseStrength = deriveBaseStrength(memory);
@@ -325,15 +138,8 @@ const applyDecayToMemories = (memories: Memory[], now = Date.now()) => {
     const prolongedBoost = daysSinceAccess > 14 ? (daysSinceAccess - 14) * 0.003 : 0; // faster after two weeks idle
     const totalDecay = gentleDecay + prolongedBoost;
 
-    const concernSignal = scoreConcernAlignment(
-      `${memory.content} ${memory.metadata?.topic || ''}`,
-      concerns
-    );
-    const decayModifier = concernSignal.alignment > 0 ? Math.max(0.35, 1 - concernSignal.alignment * 0.5) : 1;
-    const adjustedDecay = totalDecay * decayModifier;
-
-    const shouldDecay = adjustedDecay >= 0.001;
-    const nextStrength = shouldDecay ? clampStrength(baseStrength - adjustedDecay) : baseStrength;
+    const shouldDecay = totalDecay >= 0.001;
+    const nextStrength = shouldDecay ? clampStrength(baseStrength - totalDecay) : baseStrength;
     if (nextStrength !== baseStrength || memory.strength !== baseStrength) {
       memories[idx] = { ...memory, strength: nextStrength };
       changed = true;
@@ -343,12 +149,7 @@ const applyDecayToMemories = (memories: Memory[], now = Date.now()) => {
           memoryId: memory.id,
           delta: nextStrength - baseStrength,
           strengthAfter: nextStrength,
-          reason:
-            concernSignal.alignment > 0.15
-              ? `Decay softened by persistent concern: ${concernSignal.topConcern?.description || 'recurring theme'}`
-              : daysSinceAccess > 14
-                ? 'Prolonged inactivity decay'
-                : 'Ambient time decay'
+          reason: daysSinceAccess > 14 ? 'Prolonged inactivity decay' : 'Ambient time decay'
         });
       }
     }

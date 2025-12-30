@@ -20,10 +20,7 @@ import {
   reinforceIdentity,
   weakenIdentity,
   mergeIdentities,
-  splitIdentityHypothesis,
-  deriveConcernThemes,
-  scoreConcernAlignment,
-  reinforceConcernTrace
+  splitIdentityHypothesis
 } from "./storage";
 import { localTranscribe } from './whisper';
 import { getDecisionBiasSnapshot } from "./cognitiveEngine";
@@ -132,18 +129,13 @@ const resolveIdentityCandidates = (message: string) => {
     return candidates.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
 };
 
-const shouldAskIdentityQuestion = (
-    candidates: ReturnType<typeof resolveIdentityCandidates>,
-    biasCaution: number,
-    concernAlignment: number = 0
-) => {
+const shouldAskIdentityQuestion = (candidates: ReturnType<typeof resolveIdentityCandidates>, biasCaution: number) => {
     if (candidates.length < 2) return false;
     const [top, second] = candidates;
     const confidenceGap = Math.abs(top.confidence - second.confidence);
-    const concernCaution = concernAlignment > 0.15 ? concernAlignment * 0.12 : 0;
-    const closenessThreshold = Math.max(0.04, 0.12 - Math.max(0, biasCaution) * 0.05 + concernCaution);
-    const cautiousEnough = biasCaution + concernCaution > 0.01;
-    const unclearTop = top.confidence < Math.min(0.85, 0.7 + Math.max(0, biasCaution + concernCaution) * 0.25);
+    const closenessThreshold = Math.max(0.04, 0.12 - Math.max(0, biasCaution) * 0.05);
+    const cautiousEnough = biasCaution > 0.01;
+    const unclearTop = top.confidence < Math.min(0.85, 0.7 + Math.max(0, biasCaution) * 0.25);
     return cautiousEnough && (confidenceGap < closenessThreshold || unclearTop);
 };
 
@@ -592,12 +584,7 @@ const handlePersonEncounter = (message: string) => {
 
     const candidates = resolveIdentityCandidates(encounter.fact);
     const biasSnapshot = getDecisionBiasSnapshot?.() || { clarityThresholdBias: 0, ambiguityToleranceBias: 0, questioningBias: 0 };
-    const concernSignal = scoreConcernAlignment(encounter.fact, deriveConcernThemes());
-    const shouldClarify = shouldAskIdentityQuestion(
-        candidates,
-        biasSnapshot.clarityThresholdBias + biasSnapshot.questioningBias,
-        concernSignal.alignment
-    );
+    const shouldClarify = shouldAskIdentityQuestion(candidates, biasSnapshot.clarityThresholdBias + biasSnapshot.questioningBias);
     const topCandidate = candidates[0];
 
     if (topCandidate && topCandidate.confidence >= 0.72 && !shouldClarify) {
@@ -938,8 +925,8 @@ export const consultBrain = async (
   const candidates = Array.from(relevantFragments)
       .sort(
         (a, b) =>
-          (b.salience * b.trust_score * (b.strength ?? 0.6) * concernLift(b)) -
-          (a.salience * a.trust_score * (a.strength ?? 0.6) * concernLift(a))
+          (b.salience * b.trust_score * (b.strength ?? 0.6)) -
+          (a.salience * a.trust_score * (a.strength ?? 0.6))
       )
       .slice(0, candidateLimit);
 
