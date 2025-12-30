@@ -1,6 +1,29 @@
 import { Memory, Place, Reminder, MemoryType, MemoryDomain, DecisionLog, TranscriptSegment } from "../types";
-import { getSettings, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, addMemory, upsertReminder, getReminders, getMemoriesInFolder, getPendingProjectDecision, savePendingProjectDecision, getPeople, addFactToPerson, savePendingPersonDecision, getPendingPersonDecision, updatePerson } from "./storage";
+import {
+  getSettings,
+  trackMemoryAccess,
+  registerMemoryIgnored,
+  saveDecisionLog,
+  getMemories,
+  getDecisionLogs,
+  addMemory,
+  upsertReminder,
+  getReminders,
+  getMemoriesInFolder,
+  getPendingProjectDecision,
+  savePendingProjectDecision,
+  getPeople,
+  addFactToPerson,
+  savePendingPersonDecision,
+  getPendingPersonDecision,
+  updatePerson,
+  reinforceIdentity,
+  weakenIdentity,
+  mergeIdentities,
+  splitIdentityHypothesis
+} from "./storage";
 import { localTranscribe } from './whisper';
+import { getDecisionBiasSnapshot } from "./cognitiveEngine";
 
 export { localTranscribe };
 
@@ -54,18 +77,93 @@ const extractPersonEncounter = (message: string): { name: string; fact: string }
     return { name, fact: message.trim() };
 };
 
-const classifyPersonDecision = (message: string): 'same' | 'new' | null => {
-    const lower = message.toLowerCase();
-    if (/(same|yes|yeah|yep|correct|existing|that one)/i.test(lower)) return 'same';
-    if (/(new|different|another|create|not the same|no|someone else)/i.test(lower)) return 'new';
-    return null;
-};
-
 const normalizeFact = (pendingFact: string, followUp: string) => {
     const trimmed = followUp.trim();
     const isBareAck = /^(yes|yeah|yep|no|new|same|correct|different|another)/i.test(trimmed) && trimmed.split(/\s+/).length <= 3;
     if (!trimmed || isBareAck) return pendingFact;
     return `${pendingFact} ${trimmed}`.trim();
+};
+
+const tokenizeContext = (text: string) => text.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 2);
+
+const estimateContextOverlap = (fact: string, contextTokens: string[]) => {
+    const factTokens = tokenizeContext(fact);
+    if (factTokens.length === 0 || contextTokens.length === 0) return 0;
+    const overlap = factTokens.filter(t => contextTokens.includes(t));
+    return Math.min(0.35, overlap.length * 0.05);
+};
+
+const scoreIdentityCandidate = (person: ReturnType<typeof getPeople>[number], message: string, memories: Memory[]) => {
+    const base = typeof person.identityConfidence === 'number' ? person.identityConfidence : 0.55;
+    const tokens = tokenizeContext(message);
+
+    const nameSignal = person.name && message.toLowerCase().includes(person.name.toLowerCase()) ? 0.18 : 0;
+    const recentness = (() => {
+        const last = new Date(person.lastUpdated).getTime();
+        const days = Math.max(0, (Date.now() - last) / 86_400_000);
+        return Math.max(0, 0.12 - days * 0.01);
+    })();
+
+    const contextualMemories = memories.filter(m =>
+        m.content.toLowerCase().includes(person.name.toLowerCase()) ||
+        m.metadata?.topic?.toLowerCase().includes(person.name.toLowerCase())
+    );
+
+    const overlapScore = contextualMemories.reduce((acc, m) => acc + estimateContextOverlap(m.content, tokens), 0);
+    const strengthSignal = contextualMemories.reduce((acc, m) => acc + (m.strength ?? 0.5) * 0.05, 0);
+
+    const confidence = Math.min(0.98, base + nameSignal + recentness + overlapScore + strengthSignal);
+    const evidence: string[] = [];
+    if (nameSignal > 0) evidence.push('Name mentioned');
+    if (recentness > 0.01) evidence.push('Recently updated');
+    if (overlapScore > 0) evidence.push('Context overlaps past facts');
+    if (strengthSignal > 0.02) evidence.push('Strong linked memories');
+
+    return { person, confidence, evidence };
+};
+
+const resolveIdentityCandidates = (message: string) => {
+    const people = getPeople();
+    const memories = getMemories();
+    const candidates = people.map(p => scoreIdentityCandidate(p, message, memories));
+    return candidates.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+};
+
+const shouldAskIdentityQuestion = (candidates: ReturnType<typeof resolveIdentityCandidates>, biasCaution: number) => {
+    if (candidates.length < 2) return false;
+    const [top, second] = candidates;
+    const confidenceGap = Math.abs(top.confidence - second.confidence);
+    const closenessThreshold = Math.max(0.04, 0.12 - Math.max(0, biasCaution) * 0.05);
+    const cautiousEnough = biasCaution > 0.01;
+    const unclearTop = top.confidence < Math.min(0.85, 0.7 + Math.max(0, biasCaution) * 0.25);
+    return cautiousEnough && (confidenceGap < closenessThreshold || unclearTop);
+};
+
+const buildIdentityQuestion = (candidates: ReturnType<typeof resolveIdentityCandidates>, name: string) => {
+    const [top, second] = candidates;
+    const hints = [top, second]
+        .filter(Boolean)
+        .map(c => {
+            const contextCue = c.evidence[0] || 'recent details you shared';
+            return `${c.person.name} because of ${contextCue}`;
+        })
+        .join(' or ');
+    const contextPrompt = top.evidence[0] || 'recent mentions';
+    return `You mentioned ${name}. Is this about ${hints}? I noticed ${contextPrompt}.`;
+};
+
+const interpretIdentityFeedback = (message: string) => {
+    const lower = message.toLowerCase();
+    const confirmSignal = /(yes|correct|that one|exactly|same)/i.test(lower);
+    const correctionSignal = /(different|someone else|not|new person|another)/i.test(lower);
+    const mergeSignal = /(merge|they are the same person|combine)/i.test(lower);
+
+    return {
+        confirmSignal,
+        correctionSignal,
+        mergeSignal,
+        detailProvided: message.split(/\s+/).length > 6
+    };
 };
 
 const handleReminderIntent = (message: string) => {
@@ -308,7 +406,7 @@ const handlePendingProjectDecision = (message: string) => {
     savePendingProjectDecision(null);
 
     if (decision === 'same') {
-        if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId);
+        if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId, 'Project confirmation reused memory');
         const reinforcement = addMemory({
             content: `Confirmed continuation of existing project "${pending.projectName}".`,
             domain: 'work',
@@ -360,47 +458,109 @@ const handlePendingPersonDecision = (message: string) => {
     const pending = getPendingPersonDecision();
     if (!pending) return null;
 
-    const decision = classifyPersonDecision(message);
-    if (!decision) return null;
-
-    const people = getPeople();
-    const person = pending.matchedPersonId ? people.find(p => p.id === pending.matchedPersonId) : null;
+    const feedback = interpretIdentityFeedback(message);
     const fact = normalizeFact(pending.fact, message);
+    const people = getPeople();
+    const hydratedCandidates = pending.candidates
+        ? pending.candidates
+              .map(c => {
+                  const person = people.find(p => p.id === c.personId);
+                  return person ? { person, confidence: c.confidence, evidence: c.evidence } : null;
+              })
+              .filter(Boolean) as ReturnType<typeof resolveIdentityCandidates>
+        : [];
+    const candidates = hydratedCandidates.length > 0 ? hydratedCandidates : resolveIdentityCandidates(message);
+
+    const fallbackPerson = pending.matchedPersonId ? people.find(p => p.id === pending.matchedPersonId) : null;
+    const topCandidate = candidates[0] || (fallbackPerson ? { person: fallbackPerson, confidence: fallbackPerson.identityConfidence ?? 0.6, evidence: [] } : null);
 
     savePendingPersonDecision(null);
 
-    if (decision === 'same' && person) {
-        addFactToPerson(person.id, fact, 'user');
+    if (feedback.mergeSignal && candidates.length >= 2) {
+        mergeIdentities(candidates[0].person.id, candidates[1].person.id, 'User signaled these are the same identity');
         const memory = addMemory({
-            content: `Person ${pending.name}: ${fact}`,
+            content: `Merged identities: ${candidates[0].person.name} with ${candidates[1].person.name}.`,
             domain: 'personal',
             type: 'fact',
-            entity: pending.name,
-            justification: 'User confirmed this matches an existing person node.',
+            entity: candidates[0].person.name,
+            justification: 'User indicated these references match.',
             metadata: {
-                folder: `personal/relationships/${pending.name.toLowerCase()}`,
+                folder: 'personal/relationships',
                 table: 'relationships',
-                topic: `${pending.name} (${person.relation})`,
+                topic: `${candidates[0].person.name} merge`,
                 owner: 'friend',
                 origin: 'manual'
             }
         });
 
         return {
-            reply: `Linked this update to ${pending.name}'s existing node and noted: ${fact}.`,
-            explanation: 'Existing person graph updated with the new encounter fact.',
+            reply: `Combined ${candidates[0].person.name} and ${candidates[1].person.name} as the same person and kept their facts together.`,
+            explanation: 'Merged overlapping identities with a reversible snapshot.',
             citations: [memory?.id].filter(Boolean) as string[],
-            assumptions: ['Future mentions of this name will use the same entity unless you tell me otherwise.']
+            assumptions: ['Revertible via identity event log if needed.']
         } as const;
     }
 
+    if (topCandidate?.person && !feedback.correctionSignal) {
+        addFactToPerson(topCandidate.person.id, fact, 'user');
+        reinforceIdentity(topCandidate.person.id, feedback.detailProvided ? 'User elaborated without contradiction' : 'User confirmed identity match');
+        const memory = addMemory({
+            content: `Person ${topCandidate.person.name}: ${fact}`,
+            domain: 'personal',
+            type: 'fact',
+            entity: topCandidate.person.name,
+            justification: feedback.detailProvided ? 'User reinforced this identity with more detail.' : 'User confirmed this identity.',
+            metadata: {
+                folder: `personal/relationships/${topCandidate.person.name.toLowerCase()}`,
+                table: 'relationships',
+                topic: `${topCandidate.person.name} (${topCandidate.person.relation})`,
+                owner: 'friend',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Linked this to ${topCandidate.person.name} with confidence ${(topCandidate.confidence || 0.5).toFixed(2)} and noted: ${fact}.`,
+            explanation: 'Identity confidence nudged upward after your confirmation.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Future mentions will bias toward this node unless corrected.']
+        } as const;
+    }
+
+    if (topCandidate?.person && feedback.correctionSignal) {
+        weakenIdentity(topCandidate.person.id, 'User corrected an identity link', true);
+        const branched = splitIdentityHypothesis(topCandidate.person.id, pending.name, fact, 'Identity confidence fell low after correction');
+        const memory = addMemory({
+            content: `New identity hypothesis for ${pending.name}: ${fact}`,
+            domain: 'personal',
+            type: 'fact',
+            entity: pending.name,
+            justification: 'User indicated prior match was wrong, so a new hypothesis was created.',
+            metadata: {
+                folder: `personal/relationships/${pending.name.toLowerCase()}`,
+                table: 'relationships',
+                topic: pending.name,
+                owner: 'friend',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Created a fresh identity hypothesis for ${pending.name} and lowered confidence on the previous candidate. Logged: ${fact}.`,
+            explanation: 'Correction applied; confidence reduced and a new node formed to keep contexts separate.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Tell me if this new node also needs to merge later.']
+        } as const;
+    }
+
+    // If no candidate existed, create a new hypothesis and store.
     updatePerson(pending.name, fact, 'Acquaintance');
     const memory = addMemory({
         content: `New person ${pending.name}: ${fact}`,
         domain: 'personal',
         type: 'fact',
         entity: pending.name,
-        justification: 'User requested a new person node after disambiguation.',
+        justification: 'New identity hypothesis created after mention.',
         metadata: {
             folder: `personal/relationships/${pending.name.toLowerCase()}`,
             table: 'relationships',
@@ -411,10 +571,10 @@ const handlePendingPersonDecision = (message: string) => {
     });
 
     return {
-        reply: `Created a new node for ${pending.name} and logged: ${fact}. Tell me more to enrich it.`,
-        explanation: 'New person captured after you asked to branch from any existing contacts.',
+        reply: `Started a new identity hypothesis for ${pending.name} and logged: ${fact}.`,
+        explanation: 'No strong candidate remained, so a fresh node was added.',
         citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Additional facts will keep this node grounded locally.']
+        assumptions: ['I will keep adjusting confidence as you add or correct facts.']
     } as const;
 };
 
@@ -422,30 +582,75 @@ const handlePersonEncounter = (message: string) => {
     const encounter = extractPersonEncounter(message);
     if (!encounter) return null;
 
-    const people = getPeople();
-    const existing = people.find(p => p.name.toLowerCase() === encounter.name.toLowerCase());
+    const candidates = resolveIdentityCandidates(encounter.fact);
+    const biasSnapshot = getDecisionBiasSnapshot?.() || { clarityThresholdBias: 0, ambiguityToleranceBias: 0, questioningBias: 0 };
+    const shouldClarify = shouldAskIdentityQuestion(candidates, biasSnapshot.clarityThresholdBias + biasSnapshot.questioningBias);
+    const topCandidate = candidates[0];
 
-    savePendingPersonDecision({
-        name: encounter.name,
-        matchedPersonId: existing?.id,
-        fact: encounter.fact,
-        createdAt: new Date().toISOString()
-    });
-
-    if (existing) {
+    if (topCandidate && topCandidate.confidence >= 0.72 && !shouldClarify) {
+        addFactToPerson(topCandidate.person.id, encounter.fact, 'user');
+        reinforceIdentity(topCandidate.person.id, 'Identity matched without objection');
+        const memory = addMemory({
+            content: `Person ${topCandidate.person.name}: ${encounter.fact}`,
+            domain: 'personal',
+            type: 'fact',
+            entity: topCandidate.person.name,
+            justification: 'High-confidence match to existing identity.',
+            metadata: {
+                folder: `personal/relationships/${topCandidate.person.name.toLowerCase()}`,
+                table: 'relationships',
+                topic: `${topCandidate.person.name} (${topCandidate.person.relation})`,
+                owner: 'friend',
+                origin: 'manual'
+            }
+        });
         return {
-            reply: `You mentioned ${encounter.name}. Is this the same ${encounter.name} you already track (${existing.relation}) or someone new?`,
-            explanation: 'Detected a person mention and need confirmation before updating the graph.',
-            citations: [],
-            assumptions: ['Waiting for your confirmation before writing to the person node.']
+            reply: `I linked this to ${topCandidate.person.name} and noted: ${encounter.fact}.`,
+            explanation: 'Confidence was high and bias was low, so I reinforced the existing identity without extra questions.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Tell me if this should be separated and I will lower confidence.']
         } as const;
     }
 
+    if (!topCandidate || topCandidate.confidence < 0.35) {
+        const newPerson = splitIdentityHypothesis(topCandidate?.person.id || 'unlinked', encounter.name, encounter.fact, 'No strong identity candidate matched');
+        const memory = addMemory({
+            content: `New identity hypothesis for ${encounter.name}: ${encounter.fact}`,
+            domain: 'personal',
+            type: 'fact',
+            entity: encounter.name,
+            justification: 'No confident match; created a fresh hypothesis.',
+            metadata: {
+                folder: `personal/relationships/${encounter.name.toLowerCase()}`,
+                table: 'relationships',
+                topic: encounter.name,
+                owner: 'friend',
+                origin: 'manual'
+            }
+        });
+        return {
+            reply: `I created a new identity hypothesis for ${encounter.name} (starting confidence ${(newPerson.identityConfidence || 0.45).toFixed(2)}). Logged: ${encounter.fact}.`,
+            explanation: 'No candidate was confident enough, so a fresh node was created with low initial confidence.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Confidence will rise or fall as you confirm or correct future mentions.']
+        } as const;
+    }
+
+    savePendingPersonDecision({
+        name: encounter.name,
+        matchedPersonId: topCandidate.person.id,
+        fact: encounter.fact,
+        createdAt: new Date().toISOString(),
+        candidates: candidates.map(c => ({ personId: c.person.id, confidence: c.confidence, evidence: c.evidence })),
+        lastPrompt: 'identity_clarification'
+    });
+
+    const clarification = buildIdentityQuestion(candidates, encounter.name);
     return {
-        reply: `Want me to create a new person node for ${encounter.name}? Share a bit more and I'll store it.`,
-        explanation: 'No existing contact matched; awaiting your go-ahead to create a fresh node.',
+        reply: clarification,
+        explanation: 'Top candidates shared similar context cues and current bias favors caution, so I asked before reinforcing.',
         citations: [],
-        assumptions: ['Will persist locally once you confirm.']
+        assumptions: ['Your next message will nudge identity confidence up or down.']
     } as const;
 };
 
@@ -462,7 +667,7 @@ const handleProjectIntent = (message: string) => {
 
     if (existing.length > 0) {
         const memory = existing[0];
-        trackMemoryAccess(memory.id);
+        trackMemoryAccess(memory.id, 'Matched existing project node');
         savePendingProjectDecision({
             projectName: normalized,
             existingMemoryId: memory.id,
@@ -711,8 +916,17 @@ export const consultBrain = async (
 
   const candidateLimit = systemStatus === 'degraded' ? 3 : 8;
   const candidates = Array.from(relevantFragments)
-      .sort((a, b) => (b.salience * b.trust_score) - (a.salience * a.trust_score))
+      .sort(
+        (a, b) =>
+          (b.salience * b.trust_score * (b.strength ?? 0.6)) -
+          (a.salience * a.trust_score * (a.strength ?? 0.6))
+      )
       .slice(0, candidateLimit);
+
+  const ignored = Array.from(relevantFragments)
+    .filter(m => !candidates.includes(m))
+    .map(m => m.id);
+  registerMemoryIgnored(ignored, 'Memory surfaced but not selected');
 
   const replyHeader = candidates.length > 0
     ? `Local-only mode: responding with cached context from ${candidates.length} memories.`
@@ -735,7 +949,7 @@ export const consultBrain = async (
     assumptions: []
   });
 
-  candidates.forEach(c => trackMemoryAccess(c.id));
+  candidates.forEach(c => trackMemoryAccess(c.id, 'Used in assembled reply'));
   return {
       reply: assembledReply || 'Local-only mode active. No relevant memories yet.',
       explanation: 'Local provider responded without cloud inference.',
