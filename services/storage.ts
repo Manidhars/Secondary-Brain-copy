@@ -1,7 +1,8 @@
-import { 
-  Memory, Person, Reminder, Place, MemoryType, MemoryDomain, ChatMessage, MemoryStatus, 
-  ChatSession, LLMSettings, UserProfile, QueueItem, TranscriptionLog, 
-  SmartDevice, Room, ConnectionProtocol, RecallPriority, DecisionLog, PersonFact, TranscriptSegment 
+import {
+  Memory, Person, Reminder, Place, MemoryType, MemoryDomain, ChatMessage, MemoryStatus,
+  ChatSession, LLMSettings, UserProfile, QueueItem, TranscriptionLog,
+  SmartDevice, Room, ConnectionProtocol, RecallPriority, DecisionLog, PersonFact, TranscriptSegment,
+  PendingProjectDecision
 } from '../types';
 
 const STORAGE_KEYS = {
@@ -16,7 +17,8 @@ const STORAGE_KEYS = {
   TRANSCRIPTION_LOGS: 'cliper_transcription_logs',
   SMART_DEVICES: 'cliper_smart_devices',
   ROOMS: 'cliper_smart_rooms',
-  DECISION_LOGS: 'cliper_decision_logs'
+  DECISION_LOGS: 'cliper_decision_logs',
+  PENDING_PROJECT: 'cliper_pending_project_decision'
 };
 
 const storage = window.sessionStorage; 
@@ -46,7 +48,7 @@ export const initializeStorage = async () => {
 
 export const getSettings = (): LLMSettings => {
   return load<LLMSettings>(STORAGE_KEYS.SETTINGS, {
-    provider: 'auto',
+    provider: 'local',
     executionMode: 'auto',
     ollamaUrl: '',
     ollamaModel: '',
@@ -55,7 +57,7 @@ export const getSettings = (): LLMSettings => {
     enableSimulation: false,
     orinMode: true,
     travelMode: false,
-    cloud_disabled: false,
+    cloud_disabled: true,
     decision_log_ttl_days: 1,
     max_writes_per_minute: 60,
     recall_sensitivity: 0.8,
@@ -71,6 +73,29 @@ export const getSettings = (): LLMSettings => {
 
 export const saveSettings = (settings: LLMSettings) => save(STORAGE_KEYS.SETTINGS, settings);
 export const getMemories = (): Memory[] => load<Memory[]>(STORAGE_KEYS.MEMORIES, []);
+
+export const getPendingProjectDecision = (): PendingProjectDecision | null => {
+  const stored = storage.getItem(STORAGE_KEYS.PENDING_PROJECT);
+  if (!stored) return null;
+  try {
+    return JSON.parse(stored);
+  } catch (e) {
+    console.warn('[Cliper] Failed to parse pending project decision', e);
+    return null;
+  }
+};
+
+export const savePendingProjectDecision = (pending: PendingProjectDecision | null) => {
+  if (!pending) {
+    storage.removeItem(STORAGE_KEYS.PENDING_PROJECT);
+    return;
+  }
+  try {
+    storage.setItem(STORAGE_KEYS.PENDING_PROJECT, JSON.stringify(pending));
+  } catch (e) {
+    console.error('[Cliper] Failed to persist pending project decision', e);
+  }
+};
 
 export const addMemory = (params: any): Memory | null => {
   const settings = getSettings();

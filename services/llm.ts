@@ -1,62 +1,8 @@
-import { GoogleGenAI, Type, Tool } from "@google/genai";
-import { Memory, Place, Person, Reminder, LLMProvider, LLMSettings, MemoryType, MemoryDomain, DecisionLog, TranscriptSegment } from "../types";
-import { getSettings, getUserProfile, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, updateMemory, deleteMemory, addMemory, addTranscriptionLog, upsertReminder, getReminders, getMemoriesInFolder } from "./storage";
+import { Memory, Place, Reminder, MemoryType, MemoryDomain, DecisionLog, TranscriptSegment } from "../types";
+import { getSettings, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, addMemory, upsertReminder, getReminders, getMemoriesInFolder, getPendingProjectDecision, savePendingProjectDecision } from "./storage";
 import { localTranscribe } from './whisper';
 
 export { localTranscribe };
-
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
-const MISTRAL_MODEL = process.env.MISTRAL_MODEL || 'mistral-large-latest';
-
-type ProviderConfig = {
-    provider: LLMProvider;
-    apiKey: string | null;
-    source: 'explicit' | 'fallback' | 'auto' | 'local_only' | 'cloud_blocked';
-};
-
-const extractMistralText = (message: any) => {
-    if (!message) return '';
-    if (typeof message.content === 'string') return message.content;
-    if (Array.isArray(message.content)) {
-        const textPart = message.content.find((p: any) => typeof p === 'string' || p.type === 'text');
-        if (!textPart) return '';
-        return typeof textPart === 'string' ? textPart : textPart.text || '';
-    }
-    return '';
-};
-
-const resolveProviderConfig = (): ProviderConfig => {
-    const settings = getSettings();
-    const requested: LLMProvider = settings.provider || 'auto';
-    const geminiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || null;
-    const mistralKey = process.env.MISTRAL_API_KEY || null;
-
-    if (settings.cloud_disabled) {
-        return { provider: 'local', apiKey: null, source: 'cloud_blocked' };
-    }
-
-    if (requested === 'gemini') {
-        if (geminiKey) return { provider: 'gemini', apiKey: geminiKey, source: 'explicit' };
-        if (mistralKey) return { provider: 'mistral', apiKey: mistralKey, source: 'fallback' };
-        return { provider: 'local', apiKey: null, source: 'fallback' };
-    }
-
-    if (requested === 'mistral') {
-        if (mistralKey) return { provider: 'mistral', apiKey: mistralKey, source: 'explicit' };
-        if (geminiKey) return { provider: 'gemini', apiKey: geminiKey, source: 'fallback' };
-        return { provider: 'local', apiKey: null, source: 'fallback' };
-    }
-
-    if (requested === 'local') {
-        return { provider: 'local', apiKey: null, source: 'explicit' };
-    }
-
-    // Auto: prefer Gemini, then Mistral, otherwise operate locally
-    if (geminiKey) return { provider: 'gemini', apiKey: geminiKey, source: 'auto' };
-    if (mistralKey) return { provider: 'mistral', apiKey: mistralKey, source: 'auto' };
-
-    return { provider: 'local', apiKey: null, source: 'local_only' };
-};
 
 const deriveDueTime = (timeFragment: string): string => {
     const now = new Date();
@@ -202,7 +148,160 @@ const handleFriendFact = (message: string) => {
     } as const;
 };
 
+const extractProjectName = (message: string) => {
+    const normalized = message.replace(/['"]/g, '');
+    const explicitMatch = normalized.match(/project\s+(?:called|named)?\s+([a-z0-9\s-]{2,})/i);
+    if (explicitMatch?.[1]) return explicitMatch[1].trim();
+
+    const workingOnMatch = normalized.match(/working on\s+([a-z0-9\s-]+)\s+project/i);
+    if (workingOnMatch?.[1]) return workingOnMatch[1].trim();
+
+    return null;
+};
+
+const uniqueSlug = (base: string) => {
+    const normalized = base.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'project';
+    const existingSlugs = new Set(
+        getMemories()
+            .filter(m => m.metadata?.table === 'projects')
+            .map(m => (m.metadata?.folder || '').split('/').pop() || '')
+            .filter(Boolean)
+    );
+
+    if (!existingSlugs.has(normalized)) return normalized;
+
+    let suffix = 2;
+    let candidate = `${normalized}-${suffix}`;
+    while (existingSlugs.has(candidate)) {
+        suffix += 1;
+        candidate = `${normalized}-${suffix}`;
+    }
+    return candidate;
+};
+
+const classifyProjectDecision = (message: string): 'same' | 'new' | null => {
+    const lower = message.toLowerCase();
+    if (/(same|yes|continue|keep|existing|resume)/i.test(lower)) return 'same';
+    if (/(different|new|separate|fresh|another)/i.test(lower)) return 'new';
+    return null;
+};
+
+const handlePendingProjectDecision = (message: string) => {
+    const pending = getPendingProjectDecision();
+    if (!pending) return null;
+
+    const decision = classifyProjectDecision(message);
+    if (!decision) return null;
+
+    savePendingProjectDecision(null);
+
+    if (decision === 'same') {
+        if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId);
+        const reinforcement = addMemory({
+            content: `Confirmed continuation of existing project "${pending.projectName}".`,
+            domain: 'work',
+            type: 'event',
+            entity: pending.projectName,
+            justification: 'User confirmed existing project node reuse.',
+            metadata: {
+                folder: `work/projects/${pending.slug || uniqueSlug(pending.projectName)}`,
+                table: 'projects',
+                topic: pending.projectName,
+                owner: 'work',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Got it — continuing with your existing "${pending.projectName}" project node.`,
+            explanation: 'Keeping all updates tied to the original project memory.',
+            citations: [pending.existingMemoryId, reinforcement?.id].filter(Boolean) as string[],
+            assumptions: ['You prefer to reuse the existing project graph.']
+        } as const;
+    }
+
+    const slug = uniqueSlug(pending.projectName);
+    const memory = addMemory({
+        content: `Parallel project node created for "${pending.projectName}" after user requested separation.`,
+        domain: 'work',
+        type: 'task',
+        entity: pending.projectName,
+        justification: 'User indicated this is a different project with the same name.',
+        metadata: {
+            folder: `work/projects/${slug}`,
+            table: 'projects',
+            topic: `${pending.projectName} (${slug})`,
+            owner: 'work',
+            origin: 'manual'
+        }
+    });
+
+    return {
+        reply: `Started a separate project thread for "${pending.projectName}" (${slug}). I'll keep it independent from the earlier node.`,
+        explanation: 'Created a new local project node to avoid merging contexts.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Treat project updates as a distinct effort.']
+    } as const;
+};
+
+const handleProjectIntent = (message: string) => {
+    const projectName = extractProjectName(message);
+    if (!projectName) return null;
+
+    const normalized = projectName.trim();
+    const slug = normalized.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'project';
+
+    const existing = getMemories().filter(m =>
+        (m.metadata?.table === 'projects') && (m.metadata?.topic || '').toLowerCase() === normalized.toLowerCase()
+    );
+
+    if (existing.length > 0) {
+        const memory = existing[0];
+        trackMemoryAccess(memory.id);
+        savePendingProjectDecision({
+            projectName: normalized,
+            existingMemoryId: memory.id,
+            slug,
+            createdAt: new Date().toISOString()
+        });
+        return {
+            reply: `I already have a project named "${normalized}" in your graph. Is this the same effort or a separate project with the same name?`,
+            explanation: 'Matched an existing project node; requesting clarification before branching the workstream.',
+            citations: [memory.id],
+            assumptions: ['Awaiting your confirmation before creating a new project node.']
+        } as const;
+    }
+
+    const memory = addMemory({
+        content: `Project node created for "${normalized}". User is currently working on it.`,
+        domain: 'work',
+        type: 'task',
+        entity: normalized,
+        justification: 'User declared an active project.',
+        metadata: {
+            folder: `work/projects/${slug}`,
+            table: 'projects',
+            topic: normalized,
+            owner: 'work',
+            origin: 'manual'
+        }
+    });
+
+    return {
+        reply: `Logged a new project called "${normalized}" in your work graph and created a fresh node for it.`,
+        explanation: 'New project node added locally for future recall and linking.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Project stored locally; no cloud calls used.']
+    } as const;
+};
+
 const handleLocalAutomations = (message: string) => {
+    const pendingProject = handlePendingProjectDecision(message);
+    if (pendingProject) return pendingProject;
+
+    const project = handleProjectIntent(message);
+    if (project) return project;
+
     const reminder = handleReminderIntent(message);
     if (reminder) return reminder;
 
@@ -216,52 +315,8 @@ const handleLocalAutomations = (message: string) => {
 };
 
 export const isApiConfigured = () => {
-    const { provider, apiKey } = resolveProviderConfig();
-    return provider !== 'local' && !!apiKey;
-};
-
-const getGeminiClient = (apiKey?: string | null) => new GoogleGenAI({ apiKey: apiKey || process.env.GEMINI_API_KEY || process.env.API_KEY });
-
-const sendMistralChat = async (messages: any[], response_format: any | undefined, apiKey: string) => {
-    const response = await fetch(process.env.MISTRAL_CHAT_URL || 'https://api.mistral.ai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-            model: MISTRAL_MODEL,
-            messages,
-            response_format
-        })
-    });
-
-    const data = await response.json();
-    const choice = data?.choices?.[0];
-    const text = extractMistralText(choice?.message);
-    return { text, raw: choice?.message };
-};
-
-const generateJson = async (prompt: string, systemInstruction?: string) => {
-    const { provider, apiKey } = resolveProviderConfig();
-
-    if (provider === 'local' || !apiKey) return '';
-
-    if (provider === 'mistral') {
-        const response = await sendMistralChat([
-            { role: 'system', content: systemInstruction || 'Respond with JSON only.' },
-            { role: 'user', content: prompt }
-        ], { type: 'json_object' }, apiKey);
-        return response.text || '';
-    }
-
-    const ai = getGeminiClient(apiKey);
-    const response = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: { responseMimeType: "application/json", ...(systemInstruction ? { systemInstruction } : {}) }
-    });
-    return response.text || '';
+    // Local-only mode: no API configuration required.
+    return true;
 };
 
 /**
@@ -353,50 +408,18 @@ const buildLocalTimeline = (memories: Memory[]) => {
     }));
 };
 
-const memoryTools: Tool = {
-  functionDeclarations: [
-    {
-      name: "modify_memory",
-      description: "Update content of existing memory.",
-      parameters: {
-        type: Type.OBJECT,
-        properties: {
-          memory_id: { type: Type.STRING },
-          new_content: { type: Type.STRING },
-          reason: { type: Type.STRING }
-        },
-        required: ["memory_id", "new_content"]
-      }
-    }
-  ]
-};
-
 const decomposeUserQuery = async (msg: string): Promise<string[]> => {
-    const { provider, apiKey } = resolveProviderConfig();
-    const prompt = `Decompose this query into 3 atomic search terms. JSON array of strings. QUERY: "${msg}"`;
-    try {
-        if (provider === 'mistral' && apiKey) {
-            const response = await sendMistralChat([
-                { role: 'system', content: 'Respond with a JSON array of strings.' },
-                { role: 'user', content: prompt }
-            ], undefined, apiKey);
-            const parsed = JSON.parse(response.text || "[]");
-            return Array.isArray(parsed) ? parsed : [msg];
-        }
+    const cleaned = msg.toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+    const tokens = cleaned.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return [msg];
 
-        if (provider === 'gemini' && apiKey) {
-            const ai = getGeminiClient(apiKey);
-            const response = await ai.models.generateContent({
-                model: GEMINI_MODEL,
-                contents: [{ role: 'user', parts: [{ text: prompt }] }],
-                config: { responseMimeType: "application/json" }
-            });
-            const parsed = JSON.parse(response.text || "[]");
-            return Array.isArray(parsed) ? parsed : [msg];
-        }
+    const unique = Array.from(new Set(tokens)).filter(t => t.length > 2);
+    const chunks: string[] = [];
+    for (let i = 0; i < unique.length && chunks.length < 3; i++) {
+        chunks.push(unique[i]);
+    }
 
-        return [msg];
-    } catch { return [msg]; }
+    return chunks.length > 0 ? chunks : [msg];
 };
 
 export const consultBrain = async (
@@ -408,8 +431,6 @@ export const consultBrain = async (
 ) => {
   const startTime = Date.now();
   const settings = getSettings();
-  const { provider, apiKey } = resolveProviderConfig();
-  const profile = getUserProfile();
 
   const automation = handleLocalAutomations(currentMessage);
   if (automation) {
@@ -468,108 +489,12 @@ export const consultBrain = async (
       .sort((a, b) => (b.salience * b.trust_score) - (a.salience * a.trust_score))
       .slice(0, candidateLimit);
 
-  const contextStr = candidates.map(m => `[ID: ${m.id}]: ${m.content}`).join("\n");
-  const systemPrompt = `You are 'Jarvis' for ${profile.name}. System Status: ${systemStatus}. RESPONSE JSON ONLY.`;
+  const replyHeader = candidates.length > 0
+    ? `Local-only mode: responding with cached context from ${candidates.length} memories.`
+    : 'Local-only mode: no cached memories matched; consider adding more context.';
 
-  const shouldUseCloud = provider !== 'local' && !!apiKey && !settings.cloud_disabled;
-
-  if (!shouldUseCloud) {
-      const replyHeader = candidates.length > 0
-        ? `Local-only mode: responding with cached context from ${candidates.length} memories.`
-        : 'Local-only mode: no cached memories matched; consider adding more context.';
-
-      const replyBody = candidates.map(c => `• ${c.content}`).join("\n");
-      const assembledReply = [replyHeader, replyBody].filter(Boolean).join("\n\n");
-
-      saveDecisionLog({
-        timestamp: Date.now(),
-        query: currentMessage,
-        memory_retrieval_used: candidates.length > 0,
-        memories_considered: searchSpace.length,
-        memories_injected: candidates.length,
-        injected_ids: candidates.map(c => c.id),
-        cloud_called: false,
-        decision_reason: 'Local provider selected (no API key / cloud disabled).',
-        retrieval_latency_ms: Date.now() - startTime,
-        cognitive_load: candidates.length / 10,
-        assumptions: []
-      });
-
-      candidates.forEach(c => trackMemoryAccess(c.id));
-      return {
-          reply: assembledReply || 'Local-only mode active. No relevant memories yet.',
-          explanation: 'Local provider responded without cloud inference.',
-          citations: candidates.map(c => c.id),
-          assumptions: []
-      };
-  }
-
-  if (provider === 'mistral' && apiKey) {
-      const response = await sendMistralChat([
-          { role: 'system', content: `${systemPrompt} Respond with JSON object including reply, explanation, citations, assumptions.` },
-          ...history.map(h => ({ role: h.role === 'model' ? 'assistant' : 'user', content: h.content })),
-          { role: 'user', content: `Context:\n${contextStr}\n\nUser: ${currentMessage}` }
-      ], { type: 'json_object' }, apiKey);
-
-      let parsed: any = { reply: response.text || "Communication failure." };
-      try {
-          parsed = JSON.parse(response.text || "{}");
-      } catch {
-          parsed.reply = response.text || parsed.reply;
-      }
-
-      saveDecisionLog({
-        timestamp: Date.now(),
-        query: currentMessage,
-        memory_retrieval_used: candidates.length > 0,
-        memories_considered: searchSpace.length,
-        memories_injected: candidates.length,
-        injected_ids: candidates.map(c => c.id),
-        cloud_called: true,
-        decision_reason: `Latency: ${Date.now() - startTime}ms`,
-        retrieval_latency_ms: Date.now() - startTime,
-        cognitive_load: candidates.length / 10,
-        assumptions: parsed.assumptions || []
-      });
-
-      candidates.forEach(c => trackMemoryAccess(c.id));
-      return {
-          reply: parsed.reply || response.text,
-          explanation: parsed.explanation,
-          citations: parsed.citations,
-          assumptions: parsed.assumptions
-      };
-  }
-
-  const ai = getGeminiClient(apiKey);
-  const chat = ai.chats.create({
-    model: GEMINI_MODEL,
-    config: {
-      systemInstruction: systemPrompt,
-      responseMimeType: "application/json",
-      tools: isObserver ? [] : [memoryTools]
-    },
-    history: history.map(h => ({ role: h.role === 'model' ? 'model' : 'user', parts: [{ text: h.content }] }))
-  });
-
-  let response = await chat.sendMessage({ message: `Context:\n${contextStr}\n\nUser: ${currentMessage}` });
-
-  // Handle Tool Calls
-  if (response.functionCalls && response.functionCalls.length > 0) {
-      for (const fc of response.functionCalls) {
-          if (fc.name === 'modify_memory') {
-              updateMemory(fc.args.memory_id as string, { content: fc.args.new_content as string });
-          }
-      }
-      response = await chat.sendMessage({ message: "Processed. Final response please." });
-  }
-
-  let parsed: any = { reply: response.text || "Communication failure." };
-  try {
-      parsed = JSON.parse(response.text || "{}");
-  } catch {
-      parsed.reply = response.text || parsed.reply;
-  }
+  const replyBody = candidates.map(c => `• ${c.content}`).join("\n");
+  const assembledReply = [replyHeader, replyBody].filter(Boolean).join("\n\n");
 
   saveDecisionLog({
     timestamp: Date.now(),
@@ -578,78 +503,36 @@ export const consultBrain = async (
     memories_considered: searchSpace.length,
     memories_injected: candidates.length,
     injected_ids: candidates.map(c => c.id),
-    cloud_called: true,
-    decision_reason: `Latency: ${Date.now() - startTime}ms`,
+    cloud_called: false,
+    decision_reason: 'Local provider selected (no API key / cloud disabled).',
     retrieval_latency_ms: Date.now() - startTime,
     cognitive_load: candidates.length / 10,
-    assumptions: parsed.assumptions || []
+    assumptions: []
   });
 
   candidates.forEach(c => trackMemoryAccess(c.id));
   return {
-      reply: parsed.reply || response.text,
-      explanation: parsed.explanation,
-      citations: parsed.citations,
-      assumptions: parsed.assumptions
+      reply: assembledReply || 'Local-only mode active. No relevant memories yet.',
+      explanation: 'Local provider responded without cloud inference.',
+      citations: candidates.map(c => c.id),
+      assumptions: []
   };
 };
 
 export const generateLongitudinalInsights = async (memories: Memory[]) => {
-    const { provider, apiKey } = resolveProviderConfig();
-    if (provider === 'local' || !apiKey) {
-        return summarizeMemoriesLocally(memories, 3);
-    }
-
-    const prompt = `Identify 3 patterns in these memories. JSON array of { content, entity, justification, domain }. MEMORIES: ${memories.slice(0, 20).map(m => m.content).join(" | ")}`;
-    try {
-        const response = await generateJson(prompt, 'Respond with JSON array of patterns.');
-        return JSON.parse(response || "[]");
-    } catch { return []; }
+    return summarizeMemoriesLocally(memories, 3);
 };
 
 export const distillInput = async (input: string) => {
-    const { provider, apiKey } = resolveProviderConfig();
-    if (provider === 'local' || !apiKey) {
-        return { memories: buildLocalDistillation(input) };
-    }
-
-    try {
-        const response = await generateJson(
-            `Extract atomic memories: "${input}"`,
-            "Output JSON array of {domain, type, entity, content, confidence, salience, justification}"
-        );
-        const parsed = JSON.parse(response || "[]");
-        return { memories: Array.isArray(parsed) ? parsed : [] };
-    } catch { return { memories: [] }; }
+    return { memories: buildLocalDistillation(input) };
 };
 
 export const verifyCrossMemoryConsistency = async (newContent: string, newDomain: string) => {
-    const { provider, apiKey } = resolveProviderConfig();
-    if (provider === 'local' || !apiKey) {
-        return { isContradictory: false, reasoning: 'Local mode: no cloud validation performed.' };
-    }
-
-    try {
-        const response = await generateJson(
-            `Check for contradictions with general knowledge: "${newContent}"`,
-            'Return JSON object: { isContradictory: boolean, reason?: string }'
-        );
-        return JSON.parse(response || "{}");
-    } catch { return { isContradictory: false }; }
+    return { isContradictory: false, reasoning: 'Local mode: no cloud validation performed.' };
 };
 
 export const reconstructEpisodicTimeline = async (memories: Memory[]) => {
-    const { provider, apiKey } = resolveProviderConfig();
-    if (provider === 'local' || !apiKey) {
-        return buildLocalTimeline(memories);
-    }
-
-    const prompt = `Stitch these memories into a narrative timeline. JSON array of { episode_name, date_range, summary, related_memories_count }. MEMORIES: ${memories.slice(0, 20).map(m => `[${m.createdAt}] ${m.content}`).join("\n")}`;
-    try {
-        const response = await generateJson(prompt, 'Return JSON array of episodes.');
-        const parsed = JSON.parse(response || "[]");
-        return Array.isArray(parsed) ? parsed : [];
-    } catch { return []; }
+    return buildLocalTimeline(memories);
 };
 
 export const speakText = (t: string) => {
