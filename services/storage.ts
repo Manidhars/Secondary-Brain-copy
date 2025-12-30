@@ -2,7 +2,7 @@ import {
   Memory, Person, Reminder, Place, MemoryType, MemoryDomain, ChatMessage, MemoryStatus,
   ChatSession, LLMSettings, UserProfile, QueueItem, TranscriptionLog,
   SmartDevice, Room, ConnectionProtocol, RecallPriority, DecisionLog, PersonFact, TranscriptSegment,
-  PendingProjectDecision
+  PendingProjectDecision, PendingPersonDecision
 } from '../types';
 
 const STORAGE_KEYS = {
@@ -18,7 +18,8 @@ const STORAGE_KEYS = {
   SMART_DEVICES: 'cliper_smart_devices',
   ROOMS: 'cliper_smart_rooms',
   DECISION_LOGS: 'cliper_decision_logs',
-  PENDING_PROJECT: 'cliper_pending_project_decision'
+  PENDING_PROJECT: 'cliper_pending_project_decision',
+  PENDING_PERSON: 'cliper_pending_person_decision'
 };
 
 const storage = window.sessionStorage; 
@@ -94,6 +95,29 @@ export const savePendingProjectDecision = (pending: PendingProjectDecision | nul
     storage.setItem(STORAGE_KEYS.PENDING_PROJECT, JSON.stringify(pending));
   } catch (e) {
     console.error('[Cliper] Failed to persist pending project decision', e);
+  }
+};
+
+export const getPendingPersonDecision = (): PendingPersonDecision | null => {
+  const stored = storage.getItem(STORAGE_KEYS.PENDING_PERSON);
+  if (!stored) return null;
+  try {
+    return JSON.parse(stored);
+  } catch (e) {
+    console.warn('[Cliper] Failed to parse pending person decision', e);
+    return null;
+  }
+};
+
+export const savePendingPersonDecision = (pending: PendingPersonDecision | null) => {
+  if (!pending) {
+    storage.removeItem(STORAGE_KEYS.PENDING_PERSON);
+    return;
+  }
+  try {
+    storage.setItem(STORAGE_KEYS.PENDING_PERSON, JSON.stringify(pending));
+  } catch (e) {
+    console.error('[Cliper] Failed to persist pending person decision', e);
   }
 };
 
