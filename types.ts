@@ -195,6 +195,13 @@ export interface TranscriptSegment {
   timestamp: number;
 }
 
+export interface PendingProjectDecision {
+  projectName: string;
+  existingMemoryId?: string;
+  slug?: string;
+  createdAt: string;
+}
+
 export interface TranscriptionLog {
   id: string;
   content: string;

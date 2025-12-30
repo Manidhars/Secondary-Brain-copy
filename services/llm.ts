@@ -1,5 +1,5 @@
 import { Memory, Place, Reminder, MemoryType, MemoryDomain, DecisionLog, TranscriptSegment } from "../types";
-import { getSettings, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, addMemory, upsertReminder, getReminders, getMemoriesInFolder } from "./storage";
+import { getSettings, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, addMemory, upsertReminder, getReminders, getMemoriesInFolder, getPendingProjectDecision, savePendingProjectDecision } from "./storage";
 import { localTranscribe } from './whisper';
 
 export { localTranscribe };
@@ -159,6 +159,91 @@ const extractProjectName = (message: string) => {
     return null;
 };
 
+const uniqueSlug = (base: string) => {
+    const normalized = base.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'project';
+    const existingSlugs = new Set(
+        getMemories()
+            .filter(m => m.metadata?.table === 'projects')
+            .map(m => (m.metadata?.folder || '').split('/').pop() || '')
+            .filter(Boolean)
+    );
+
+    if (!existingSlugs.has(normalized)) return normalized;
+
+    let suffix = 2;
+    let candidate = `${normalized}-${suffix}`;
+    while (existingSlugs.has(candidate)) {
+        suffix += 1;
+        candidate = `${normalized}-${suffix}`;
+    }
+    return candidate;
+};
+
+const classifyProjectDecision = (message: string): 'same' | 'new' | null => {
+    const lower = message.toLowerCase();
+    if (/(same|yes|continue|keep|existing|resume)/i.test(lower)) return 'same';
+    if (/(different|new|separate|fresh|another)/i.test(lower)) return 'new';
+    return null;
+};
+
+const handlePendingProjectDecision = (message: string) => {
+    const pending = getPendingProjectDecision();
+    if (!pending) return null;
+
+    const decision = classifyProjectDecision(message);
+    if (!decision) return null;
+
+    savePendingProjectDecision(null);
+
+    if (decision === 'same') {
+        if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId);
+        const reinforcement = addMemory({
+            content: `Confirmed continuation of existing project "${pending.projectName}".`,
+            domain: 'work',
+            type: 'event',
+            entity: pending.projectName,
+            justification: 'User confirmed existing project node reuse.',
+            metadata: {
+                folder: `work/projects/${pending.slug || uniqueSlug(pending.projectName)}`,
+                table: 'projects',
+                topic: pending.projectName,
+                owner: 'work',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Got it — continuing with your existing "${pending.projectName}" project node.`,
+            explanation: 'Keeping all updates tied to the original project memory.',
+            citations: [pending.existingMemoryId, reinforcement?.id].filter(Boolean) as string[],
+            assumptions: ['You prefer to reuse the existing project graph.']
+        } as const;
+    }
+
+    const slug = uniqueSlug(pending.projectName);
+    const memory = addMemory({
+        content: `Parallel project node created for "${pending.projectName}" after user requested separation.`,
+        domain: 'work',
+        type: 'task',
+        entity: pending.projectName,
+        justification: 'User indicated this is a different project with the same name.',
+        metadata: {
+            folder: `work/projects/${slug}`,
+            table: 'projects',
+            topic: `${pending.projectName} (${slug})`,
+            owner: 'work',
+            origin: 'manual'
+        }
+    });
+
+    return {
+        reply: `Started a separate project thread for "${pending.projectName}" (${slug}). I'll keep it independent from the earlier node.`,
+        explanation: 'Created a new local project node to avoid merging contexts.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Treat project updates as a distinct effort.']
+    } as const;
+};
+
 const handleProjectIntent = (message: string) => {
     const projectName = extractProjectName(message);
     if (!projectName) return null;
@@ -173,6 +258,12 @@ const handleProjectIntent = (message: string) => {
     if (existing.length > 0) {
         const memory = existing[0];
         trackMemoryAccess(memory.id);
+        savePendingProjectDecision({
+            projectName: normalized,
+            existingMemoryId: memory.id,
+            slug,
+            createdAt: new Date().toISOString()
+        });
         return {
             reply: `I already have a project named "${normalized}" in your graph. Is this the same effort or a separate project with the same name?`,
             explanation: 'Matched an existing project node; requesting clarification before branching the workstream.',
@@ -205,6 +296,9 @@ const handleProjectIntent = (message: string) => {
 };
 
 const handleLocalAutomations = (message: string) => {
+    const pendingProject = handlePendingProjectDecision(message);
+    if (pendingProject) return pendingProject;
+
     const project = handleProjectIntent(message);
     if (project) return project;
 
