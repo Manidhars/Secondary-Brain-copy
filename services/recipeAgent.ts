@@ -1,5 +1,4 @@
 
-import { GoogleGenAI, Tool, FunctionDeclaration, Type, GenerateContentResponse } from "@google/genai";
 import { getSettings } from "./storage";
 import { ChatMessage } from "../types";
 
@@ -32,30 +31,14 @@ const RECIPE_DB = [
 const searchRecipes = (query: string) => {
     console.log(`[RecipeAgent] Searching for: ${query}`);
     const lowerQ = query.toLowerCase();
-    
-    const results = RECIPE_DB.filter(r => 
-        r.name.toLowerCase().includes(lowerQ) || 
+
+    const results = RECIPE_DB.filter(r =>
+        r.name.toLowerCase().includes(lowerQ) ||
         r.ingredients.some(i => i.toLowerCase().includes(lowerQ)) ||
         r.tags.some(t => t.toLowerCase().includes(lowerQ))
     );
 
-    if (results.length === 0) return "No specific recipes found in database. Suggest general cooking knowledge.";
-    return JSON.stringify(results);
-};
-
-// Tool Definition for Gemini
-const recipeTool: Tool = {
-    functionDeclarations: [{
-        name: "search_recipes",
-        description: "Search the internal database for specific recipes, ingredients, or instructions.",
-        parameters: {
-            type: Type.OBJECT,
-            properties: {
-                query: { type: Type.STRING, description: "The food item, ingredient, or cuisine to search for." }
-            },
-            required: ["query"]
-        }
-    }]
+    return results;
 };
 
 // --- 3. THE AGENT RUNNER (ReAct Loop) ---
@@ -67,90 +50,31 @@ export interface RecipeAgentResponse {
 }
 
 export const runRecipeAgent = async (
-    history: ChatMessage[], 
+    history: ChatMessage[],
     currentMessage: string
 ): Promise<RecipeAgentResponse> => {
     const settings = getSettings();
-    // Correctly obtain API key from environment
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    
-    const systemInstruction = `
-    You are a Specialized Recipe Agent.
-    
-    PROTOCOL (ReAct):
-    1. **REASON**: Analyze the user's request. Do you have the specific recipe details in your chat history context? Or do you need to look it up?
-    2. **ACT**: If you need details, call \`search_recipes\`. If it's chit-chat or you already know (e.g. follow-up question), skip to Respond.
-    3. **OBSERVE**: Use the tool result.
-    4. **RESPOND**: Answer the user.
+    const results = searchRecipes(currentMessage);
+    const usedRetrieval = results.length > 0;
 
-    OUTPUT FORMAT:
-    You are friendly and helpful. If you looked up a recipe, mention that you found it in the database.
-    `;
-
-    let usedRetrieval = false;
-    let reasoning = "Direct Answer (Memory/General Knowledge)";
-
-    try {
-        // Correct initialization of chat and query with tools
-        const chat = ai.chats.create({
-            model: 'gemini-3-flash-preview',
-            config: { 
-                systemInstruction, 
-                tools: [recipeTool] 
-            },
-            history: history.map(m => ({ 
-                role: m.role === 'model' ? 'model' : 'user', 
-                parts: [{ text: m.content }] 
-            }))
-        });
-
-        // 1. Send Message - must use named parameter 'message'
-        let response = await chat.sendMessage({ message: currentMessage });
-        
-        // 2. Check for Function Calls via .functionCalls property
-        const functionCalls = response.functionCalls;
-        
-        if (functionCalls && functionCalls.length > 0) {
-            usedRetrieval = true;
-            const call = functionCalls[0];
-            reasoning = `Retrieval Triggered: Searching for "${call.args['query']}"`;
-            
-            // 3. Execute Tool (Act)
-            const apiResult = searchRecipes(call.args['query'] as string);
-            
-            // 4. Send Result back to Model (Observe) - must use named parameter 'message'
-            const finalResult = await chat.sendMessage({
-                message: [
-                    {
-                        functionResponse: {
-                            name: call.name,
-                            id: call.id,
-                            response: { result: apiResult }
-                        }
-                    }
-                ]
-            });
-            
-            return {
-                text: finalResult.text || "I found something but can't explain it.",
-                usedRetrieval: true,
-                reasoning: reasoning
-            };
-        }
-
-        // No tool called -> Direct response
+    if (!usedRetrieval) {
         return {
-            text: response.text || "Acknowledged.",
+            text: "I couldn't find that in the pantry. Try mentioning an ingredient or cuisine and I'll search again.",
             usedRetrieval: false,
-            reasoning: "Reasoning: Sufficient context in history or general chit-chat."
-        };
-
-    } catch (e: any) {
-        console.error("Recipe Agent Failed", e);
-        return {
-            text: "I burned the sauce. (System Error: " + e.message + ")",
-            usedRetrieval: false,
-            reasoning: "Error encountered."
+            reasoning: "No recipe matched the query; prompting for clarification."
         };
     }
+
+    const summary = results
+        .slice(0, 3)
+        .map(r => `• ${r.name}: ${r.steps.split('.')
+            .slice(0, 2)
+            .join('.')}...`)
+        .join("\n");
+
+    return {
+        text: `Found ${results.length} recipe${results.length === 1 ? '' : 's'} that match: \n${summary}`,
+        usedRetrieval,
+        reasoning: `Queried local recipe memory for "${currentMessage}".`
+    };
 };

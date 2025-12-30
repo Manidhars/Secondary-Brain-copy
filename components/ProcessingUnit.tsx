@@ -79,7 +79,7 @@ const ProcessingUnit: React.FC = () => {
   const processItem = async (item: any) => {
     isProcessingRef.current = true;
     const settings = getSettings();
-    const modelTag = settings.cloud_disabled ? 'local-llm' : 'gemini-3-flash';
+    const modelTag = 'local-llm';
     
     try {
       updateQueueItem(item.id, { status: 'processing' });

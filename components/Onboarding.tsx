@@ -78,7 +78,7 @@ const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
         });
 
         const settings = getSettings();
-        if (!settings.ollamaUrl && !process.env.API_KEY) {
+        if (!settings.ollamaUrl) {
             saveSettings({ ...settings, enableSimulation: true });
         }
 
