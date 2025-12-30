@@ -202,6 +202,13 @@ export interface PendingProjectDecision {
   createdAt: string;
 }
 
+export interface PendingPersonDecision {
+  name: string;
+  matchedPersonId?: string;
+  fact: string;
+  createdAt: string;
+}
+
 export interface TranscriptionLog {
   id: string;
   content: string;
