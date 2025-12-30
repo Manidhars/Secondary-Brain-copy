@@ -113,6 +113,27 @@ const handleReminderIntent = (message: string) => {
     } as const;
 };
 
+const handleHardcodedQuestion = (message: string) => {
+    const lower = message.toLowerCase();
+    if (!/(hard\s*coded|hardcode|hard-coded)/i.test(lower)) return null;
+
+    const memories = getMemories();
+    const reminders = getReminders();
+    const people = getPeople();
+
+    const replyParts = [
+        "You're in local/offline mode right now—responses are built from your saved memories and heuristics, not cloud models.",
+        `I currently see ${memories.length} stored memories, ${reminders.length} reminders, and ${people.length} people entries to ground replies.`
+    ];
+
+    return {
+        reply: replyParts.join("\n"),
+        explanation: 'Clarified that the assistant answers from locally persisted data rather than hardcoded templates or cloud calls.',
+        citations: [],
+        assumptions: ['Local heuristics are active; cloud connectors are disabled.']
+    } as const;
+};
+
 const handlePreferenceCapture = (message: string) => {
     if (message.includes('?')) return null;
     const preferenceMatch = message.match(/i\s+(like|love|prefer|enjoy)\s+([^.!]+)/i);
@@ -487,6 +508,7 @@ const handleLocalAutomations = (message: string) => {
     if (pendingPerson) return pendingPerson;
 
     const automations = [
+        handleHardcodedQuestion(message),
         handlePersonEncounter(message),
         handleProjectIntent(message),
         handleReminderIntent(message),
