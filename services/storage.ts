@@ -46,10 +46,10 @@ export const initializeStorage = async () => {
 
 export const getSettings = (): LLMSettings => {
   return load<LLMSettings>(STORAGE_KEYS.SETTINGS, {
-    provider: 'gemini', 
+    provider: 'auto',
     executionMode: 'auto',
     ollamaUrl: '',
-    ollamaModel: '', 
+    ollamaModel: '',
     mcpEnabled: false,
     mcpEndpoint: '',
     enableSimulation: false,
@@ -101,7 +101,8 @@ export const addMemory = (params: any): Memory | null => {
     isPendingApproval: params.isPendingApproval || false,
     isPinned: params.isPinned || false,
     justification: params.justification || "Session Insight",
-    cluster: settings.active_cluster
+    cluster: settings.active_cluster,
+    metadata: params.metadata || undefined
   };
 
   save(STORAGE_KEYS.MEMORIES, [newMemory, ...memories]);
@@ -129,6 +130,11 @@ export const updateMemory = (id: string, updates: Partial<Memory>) => {
 export const deleteMemory = (id: string) => {
   const memories = getMemories();
   save(STORAGE_KEYS.MEMORIES, memories.filter(m => m.id !== id));
+};
+
+export const getMemoriesInFolder = (folderPrefix: string): Memory[] => {
+  const normalized = folderPrefix.toLowerCase();
+  return getMemories().filter(m => (m.metadata?.folder || '').toLowerCase().startsWith(normalized));
 };
 
 export const trackMemoryAccess = (id: string) => {
@@ -184,6 +190,42 @@ export const removeFactFromPerson = (personId: string, factId: string) => {
 };
 
 export const getReminders = (): Reminder[] => load<Reminder[]>(STORAGE_KEYS.REMINDERS, []);
+export const upsertReminder = (task: string, dueTime: string, completed: boolean = false): Reminder => {
+  const reminders = getReminders();
+  const normalizedTask = task.trim().toLowerCase();
+  const existingIdx = reminders.findIndex(r => r.task.trim().toLowerCase() === normalizedTask);
+
+  const updatedReminder: Reminder = existingIdx >= 0
+    ? { ...reminders[existingIdx], task, dueTime, completed }
+    : { id: crypto.randomUUID(), task, dueTime, completed };
+
+  if (existingIdx >= 0) {
+    reminders[existingIdx] = updatedReminder;
+  } else {
+    reminders.unshift(updatedReminder);
+  }
+
+  save(STORAGE_KEYS.REMINDERS, reminders);
+  return updatedReminder;
+};
+
+export const completeReminder = (id: string, completed: boolean = true) => {
+  const reminders = getReminders();
+  const idx = reminders.findIndex(r => r.id === id);
+  if (idx >= 0) {
+    reminders[idx].completed = completed;
+    save(STORAGE_KEYS.REMINDERS, reminders);
+  }
+};
+
+export const rescheduleReminder = (id: string, dueTime: string) => {
+  const reminders = getReminders();
+  const idx = reminders.findIndex(r => r.id === id);
+  if (idx >= 0) {
+    reminders[idx].dueTime = dueTime;
+    save(STORAGE_KEYS.REMINDERS, reminders);
+  }
+};
 export const getSessions = (): ChatSession[] => load<ChatSession[]>(STORAGE_KEYS.SESSIONS, []);
 export const createSession = (mode: 'active' | 'observer' = 'active'): ChatSession => {
   const s: ChatSession = { id: crypto.randomUUID(), title: 'Session ' + new Date().toLocaleTimeString(), messages: [], lastUpdated: Date.now(), mode };
@@ -235,6 +277,23 @@ export const addTranscriptionLog = (content: string, source: 'upload' | 'live', 
   const logs = getTranscriptionLogs();
   const newLog: TranscriptionLog = { id: crypto.randomUUID(), content, source, timestamp: Date.now(), segments };
   save(STORAGE_KEYS.TRANSCRIPTION_LOGS, [newLog, ...logs]);
+
+  // Mirror the transcript into memory for downstream retrieval/QA flows
+  const summarySeed = content.split(/(?<=[.!?])\s+/).slice(0, 3).join(' ');
+  addMemory({
+    content: summarySeed || content.slice(0, 280),
+    domain: 'work',
+    type: 'summary',
+    entity: source === 'upload' ? 'meeting' : 'live_call',
+    justification: 'Auto-ingested transcript',
+    metadata: {
+      folder: 'work/calls',
+      table: 'transcripts',
+      topic: summarySeed ? summarySeed.slice(0, 60) : 'call',
+      owner: 'work',
+      origin: 'transcript'
+    }
+  });
 };
 export const deleteTranscriptionLog = (id: string) => save(STORAGE_KEYS.TRANSCRIPTION_LOGS, getTranscriptionLogs().filter(l => l.id !== id));
 

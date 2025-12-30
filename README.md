@@ -15,6 +15,11 @@ View your app in AI Studio: https://ai.studio/apps/drive/1xbQTfFLX1fMGrqcNRk39-c
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+2. (Optional for cloud cognition) Provide an LLM API key in [.env.local](.env.local):
+   - `GEMINI_API_KEY` (or legacy `API_KEY`) for Google Gemini
+   - `MISTRAL_API_KEY` for Mistral chat completions
+   - With no keys, the app stays in local-only mode.
 3. Run the app:
    `npm run dev`
+4. Choose your provider in **Settings → LLM Provider** (Auto/local-first default; Gemini or Mistral used when keys exist).
+5. Local automations: reminders, self preferences, friend facts, and meeting transcripts are auto-organized into folders (`personal/self`, `personal/friends/{name}`, `work/calls`) so the chat agent can answer from your data even without cloud calls.
