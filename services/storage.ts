@@ -19,10 +19,85 @@ const STORAGE_KEYS = {
   ROOMS: 'cliper_smart_rooms',
   DECISION_LOGS: 'cliper_decision_logs',
   PENDING_PROJECT: 'cliper_pending_project_decision',
-  PENDING_PERSON: 'cliper_pending_person_decision'
+  PENDING_PERSON: 'cliper_pending_person_decision',
+  MEMORY_EVENTS: 'cliper_memory_events'
 };
 
-const storage = window.sessionStorage; 
+type MemoryAdjustmentEvent = {
+  timestamp: number;
+  memoryId: string;
+  delta: number;
+  strengthAfter: number;
+  reason: string;
+};
+
+const storage = window.sessionStorage;
+
+const clampStrength = (value: number) => Math.min(1.25, Math.max(0.05, value));
+
+const getMemoryEvents = (): MemoryAdjustmentEvent[] => load<MemoryAdjustmentEvent[]>(STORAGE_KEYS.MEMORY_EVENTS, []);
+
+const recordMemoryEvent = (event: MemoryAdjustmentEvent) => {
+  const events = [event, ...getMemoryEvents()].slice(0, 200);
+  save(STORAGE_KEYS.MEMORY_EVENTS, events);
+  console.info(
+    `[Cliper] Memory ${event.memoryId} strength adjusted by ${event.delta.toFixed(3)} to ${event.strengthAfter.toFixed(
+      3
+    )} (${event.reason}).`
+  );
+};
+
+const deriveBaseStrength = (memory: Memory) => {
+  if (typeof memory.strength === 'number') return memory.strength;
+  const salienceSeed = typeof memory.salience === 'number' ? memory.salience : 0.5;
+  return clampStrength(0.5 + salienceSeed * 0.3);
+};
+
+const applyStrengthDelta = (memory: Memory, delta: number, reason: string, now = Date.now()) => {
+  const prior = deriveBaseStrength(memory);
+  const updated = clampStrength(prior + delta);
+  if (Math.abs(updated - prior) < 0.0005) {
+    memory.strength = prior;
+    return prior;
+  }
+  memory.strength = updated;
+  recordMemoryEvent({ timestamp: now, memoryId: memory.id, delta: updated - prior, strengthAfter: updated, reason });
+  return updated;
+};
+
+const applyDecayToMemories = (memories: Memory[], now = Date.now()) => {
+  let changed = false;
+
+  memories.forEach((memory, idx) => {
+    const baseStrength = deriveBaseStrength(memory);
+    const lastTouch = new Date(memory.lastAccessedAt || memory.updatedAt || memory.createdAt || now).getTime();
+    const daysSinceAccess = Math.max(0, (now - lastTouch) / 86_400_000);
+
+    // Slow decay that accelerates with prolonged inactivity but never drops abruptly.
+    const gentleDecay = daysSinceAccess * 0.002; // ~0.02 over 10 days
+    const prolongedBoost = daysSinceAccess > 14 ? (daysSinceAccess - 14) * 0.003 : 0; // faster after two weeks idle
+    const totalDecay = gentleDecay + prolongedBoost;
+
+    const shouldDecay = totalDecay >= 0.001;
+    const nextStrength = shouldDecay ? clampStrength(baseStrength - totalDecay) : baseStrength;
+    if (nextStrength !== baseStrength || memory.strength !== baseStrength) {
+      memories[idx] = { ...memory, strength: nextStrength };
+      changed = true;
+      if (shouldDecay && nextStrength !== baseStrength) {
+        recordMemoryEvent({
+          timestamp: now,
+          memoryId: memory.id,
+          delta: nextStrength - baseStrength,
+          strengthAfter: nextStrength,
+          reason: daysSinceAccess > 14 ? 'Prolonged inactivity decay' : 'Ambient time decay'
+        });
+      }
+    }
+  });
+
+  if (changed) save(STORAGE_KEYS.MEMORIES, memories);
+  return memories;
+};
 
 const save = async (key: string, data: any) => {
     try {
@@ -73,7 +148,10 @@ export const getSettings = (): LLMSettings => {
 };
 
 export const saveSettings = (settings: LLMSettings) => save(STORAGE_KEYS.SETTINGS, settings);
-export const getMemories = (): Memory[] => load<Memory[]>(STORAGE_KEYS.MEMORIES, []);
+export const getMemories = (): Memory[] => {
+  const hydrated = load<Memory[]>(STORAGE_KEYS.MEMORIES, []).map(m => ({ ...m, strength: deriveBaseStrength(m) }));
+  return applyDecayToMemories(hydrated);
+};
 
 export const getPendingProjectDecision = (): PendingProjectDecision | null => {
   const stored = storage.getItem(STORAGE_KEYS.PENDING_PROJECT);
@@ -145,8 +223,9 @@ export const addMemory = (params: any): Memory | null => {
     createdAt: new Date().toISOString(),
     lastAccessedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    strength: clampStrength(params.strength ?? (0.6 + (params.salience ?? 0.8) * 0.15)),
     accessCount: 1,
-    isLocked: false, 
+    isLocked: false,
     isPendingApproval: params.isPendingApproval || false,
     isPinned: params.isPinned || false,
     justification: params.justification || "Session Insight",
@@ -171,7 +250,22 @@ export const updateMemory = (id: string, updates: Partial<Memory>) => {
   const memories = getMemories();
   const idx = memories.findIndex(m => m.id === id);
   if (idx !== -1) {
-    memories[idx] = { ...memories[idx], ...updates, updatedAt: new Date().toISOString() };
+    const now = Date.now();
+    const prior = memories[idx];
+    memories[idx] = { ...prior, ...updates, updatedAt: new Date(now).toISOString() };
+
+    const justificationSignals = [updates.justification, updates.metadata?.validation_reason].filter(Boolean).join(' ');
+    const appearsCorrected = /correction|contradict|fix|revise|update/i.test(justificationSignals);
+    const confidenceMoved =
+      typeof updates.confidence === 'number' && typeof prior.confidence === 'number'
+        ? updates.confidence - prior.confidence
+        : 0;
+
+    if (appearsCorrected || confidenceMoved < -0.05) {
+      applyStrengthDelta(memories[idx], -0.04, 'Memory corrected or contradicted', now);
+    } else if (confidenceMoved > 0.05) {
+      applyStrengthDelta(memories[idx], 0.02, 'Memory reinforced by confirmation', now);
+    }
     save(STORAGE_KEYS.MEMORIES, memories);
   }
 };
@@ -186,14 +280,32 @@ export const getMemoriesInFolder = (folderPrefix: string): Memory[] => {
   return getMemories().filter(m => (m.metadata?.folder || '').toLowerCase().startsWith(normalized));
 };
 
-export const trackMemoryAccess = (id: string) => {
+export const trackMemoryAccess = (id: string, reason: string = 'Retrieved for reasoning') => {
   const memories = getMemories();
   const idx = memories.findIndex(m => m.id === id);
   if (idx !== -1) {
+    const nowIso = new Date().toISOString();
     memories[idx].accessCount++;
-    memories[idx].lastAccessedAt = new Date().toISOString();
+    memories[idx].lastAccessedAt = nowIso;
+    applyStrengthDelta(memories[idx], 0.05, `${reason} (access count ${memories[idx].accessCount})`, Date.parse(nowIso));
     save(STORAGE_KEYS.MEMORIES, memories);
   }
+};
+
+export const registerMemoryIgnored = (ids: string[], reason: string = 'Surface ignored in retrieval') => {
+  if (ids.length === 0) return;
+  const memories = getMemories();
+  let changed = false;
+
+  ids.forEach(id => {
+    const idx = memories.findIndex(m => m.id === id);
+    if (idx !== -1) {
+      applyStrengthDelta(memories[idx], -0.01, `${reason} (access count ${memories[idx].accessCount})`);
+      changed = true;
+    }
+  });
+
+  if (changed) save(STORAGE_KEYS.MEMORIES, memories);
 };
 
 export const getPeople = (): Person[] => load<Person[]>(STORAGE_KEYS.PEOPLE, []);

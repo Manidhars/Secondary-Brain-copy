@@ -1,5 +1,23 @@
 import { Memory, Place, Reminder, MemoryType, MemoryDomain, DecisionLog, TranscriptSegment } from "../types";
-import { getSettings, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, addMemory, upsertReminder, getReminders, getMemoriesInFolder, getPendingProjectDecision, savePendingProjectDecision, getPeople, addFactToPerson, savePendingPersonDecision, getPendingPersonDecision, updatePerson } from "./storage";
+import {
+  getSettings,
+  trackMemoryAccess,
+  registerMemoryIgnored,
+  saveDecisionLog,
+  getMemories,
+  getDecisionLogs,
+  addMemory,
+  upsertReminder,
+  getReminders,
+  getMemoriesInFolder,
+  getPendingProjectDecision,
+  savePendingProjectDecision,
+  getPeople,
+  addFactToPerson,
+  savePendingPersonDecision,
+  getPendingPersonDecision,
+  updatePerson
+} from "./storage";
 import { localTranscribe } from './whisper';
 
 export { localTranscribe };
@@ -308,7 +326,7 @@ const handlePendingProjectDecision = (message: string) => {
     savePendingProjectDecision(null);
 
     if (decision === 'same') {
-        if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId);
+        if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId, 'Project confirmation reused memory');
         const reinforcement = addMemory({
             content: `Confirmed continuation of existing project "${pending.projectName}".`,
             domain: 'work',
@@ -462,7 +480,7 @@ const handleProjectIntent = (message: string) => {
 
     if (existing.length > 0) {
         const memory = existing[0];
-        trackMemoryAccess(memory.id);
+        trackMemoryAccess(memory.id, 'Matched existing project node');
         savePendingProjectDecision({
             projectName: normalized,
             existingMemoryId: memory.id,
@@ -711,8 +729,17 @@ export const consultBrain = async (
 
   const candidateLimit = systemStatus === 'degraded' ? 3 : 8;
   const candidates = Array.from(relevantFragments)
-      .sort((a, b) => (b.salience * b.trust_score) - (a.salience * a.trust_score))
+      .sort(
+        (a, b) =>
+          (b.salience * b.trust_score * (b.strength ?? 0.6)) -
+          (a.salience * a.trust_score * (a.strength ?? 0.6))
+      )
       .slice(0, candidateLimit);
+
+  const ignored = Array.from(relevantFragments)
+    .filter(m => !candidates.includes(m))
+    .map(m => m.id);
+  registerMemoryIgnored(ignored, 'Memory surfaced but not selected');
 
   const replyHeader = candidates.length > 0
     ? `Local-only mode: responding with cached context from ${candidates.length} memories.`
@@ -735,7 +762,7 @@ export const consultBrain = async (
     assumptions: []
   });
 
-  candidates.forEach(c => trackMemoryAccess(c.id));
+  candidates.forEach(c => trackMemoryAccess(c.id, 'Used in assembled reply'));
   return {
       reply: assembledReply || 'Local-only mode active. No relevant memories yet.',
       explanation: 'Local provider responded without cloud inference.',
