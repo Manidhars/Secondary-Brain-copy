@@ -1,6 +1,6 @@
 
 import React, { useState } from 'react';
-import { Save, Server, ShieldOff, EyeOff, ShieldCheck, Database, RefreshCw, Layers, Wind, ShieldAlert, Download, Upload, Trash2, Key } from 'lucide-react';
+import { Save, Server, ShieldOff, EyeOff, ShieldCheck, Database, RefreshCw, Layers, Wind, ShieldAlert, Download, Upload, Trash2, Key, Bot } from 'lucide-react';
 import { LLMSettings } from '../types';
 import { getSettings, saveSettings, getStorageUsage, triggerSync, runColdStorageMaintenance, exportData, importData, factoryReset } from '../services/storage';
 
@@ -8,6 +8,13 @@ const Settings: React.FC = () => {
   const [settings, setSettings] = useState<LLMSettings>(getSettings());
   const [isSaved, setIsSaved] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
+
+  const providerEnvHint: Record<string, string> = {
+      auto: 'Optional: GEMINI_API_KEY or MISTRAL_API_KEY (auto-picks when present)',
+      gemini: 'GEMINI_API_KEY (falls back to API_KEY for legacy setups)',
+      mistral: 'MISTRAL_API_KEY',
+      local: 'No cloud keys required (offline only)'
+  };
 
   const handleSave = () => {
     saveSettings(settings);
@@ -49,6 +56,60 @@ const Settings: React.FC = () => {
         </h2>
         <p className="text-slate-400 mt-1">Advanced cognitive tiers and synchronization parameters.</p>
       </header>
+
+      {/* PROVIDER SELECTION */}
+      <div className="bg-slate-900/50 border border-slate-800 rounded-3xl p-8 space-y-4">
+          <div className="flex justify-between items-center flex-wrap gap-4">
+              <h3 className="font-bold text-slate-100 flex items-center gap-2"><Bot className="w-5 h-5 text-indigo-400" /> LLM Provider</h3>
+              <span className="text-[10px] uppercase tracking-widest text-slate-500">Env: {providerEnvHint[settings.provider] || 'Local-first (no key required)'}</span>
+          </div>
+          <p className="text-slate-400 text-sm">Default mode is local-first auto selection: stay offline until a valid cloud key is present, then route to Gemini or Mistral automatically.</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+              <button
+                onClick={() => setSettings({ ...settings, provider: 'auto' })}
+                className={`p-6 rounded-2xl border text-left transition-all ${settings.provider === 'auto' ? 'border-indigo-500 bg-indigo-600/10' : 'border-slate-700 bg-slate-800/50 opacity-60'}`}
+              >
+                  <div className="flex items-center justify-between">
+                      <div className="font-bold text-slate-100">Auto (local-first)</div>
+                      <span className="text-[10px] text-indigo-300 uppercase">Default</span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1">Stay offline by default, automatically upgrade to configured cloud keys when available.</p>
+              </button>
+
+              <button
+                onClick={() => setSettings({ ...settings, provider: 'gemini' })}
+                className={`p-6 rounded-2xl border text-left transition-all ${settings.provider === 'gemini' ? 'border-indigo-500 bg-indigo-600/10' : 'border-slate-700 bg-slate-800/50 opacity-60'}`}
+              >
+                  <div className="flex items-center justify-between">
+                      <div className="font-bold text-slate-100">Gemini</div>
+                      <span className="text-[10px] text-indigo-300 uppercase">Cloud</span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1">Uses GEMINI_API_KEY (or API_KEY legacy) for reasoning and memory tools.</p>
+              </button>
+
+              <button
+                onClick={() => setSettings({ ...settings, provider: 'mistral' })}
+                className={`p-6 rounded-2xl border text-left transition-all ${settings.provider === 'mistral' ? 'border-emerald-500 bg-emerald-600/10' : 'border-slate-700 bg-slate-800/50 opacity-60'}`}
+              >
+                  <div className="flex items-center justify-between">
+                      <div className="font-bold text-slate-100">Mistral</div>
+                      <span className="text-[10px] text-emerald-300 uppercase">Cloud</span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1">Route chat and analysis to Mistral via MISTRAL_API_KEY.</p>
+              </button>
+
+              <button
+                onClick={() => setSettings({ ...settings, provider: 'local' })}
+                className={`p-6 rounded-2xl border text-left transition-all ${settings.provider === 'local' ? 'border-slate-500 bg-slate-800' : 'border-slate-700 bg-slate-800/50 opacity-60'}`}
+              >
+                  <div className="flex items-center justify-between">
+                      <div className="font-bold text-slate-100">Local only</div>
+                      <span className="text-[10px] text-slate-300 uppercase">Offline</span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1">Force offline cognition even if keys are configured.</p>
+              </button>
+          </div>
+      </div>
 
       {/* CLUSTER SELECTION */}
       <div className="bg-slate-900/50 border border-slate-800 rounded-3xl p-8 space-y-6">
