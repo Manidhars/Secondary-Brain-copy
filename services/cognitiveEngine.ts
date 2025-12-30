@@ -1,23 +1,24 @@
 import { recordBiasDriftSnapshot } from './storage';
 
-export interface ReasoningResult {
+export interface Proposal {
   summaryOfChange: string;
-  confidence: number; // 0-1
-  ambiguity: number; // 0-1
-  questionsToAsk: string[];
   suggestedEffects: string[]; // descriptive phrases only
+  confidenceEstimate: number; // 0-1
+  ambiguityEstimate: number; // 0-1
+  followUpQuestions?: string[];
 }
 
 export interface Decision {
-  action: 'storeMemory' | 'askClarifyingQuestions' | 'noAction';
+  action: 'apply' | 'askClarifyingQuestions' | 'defer' | 'ignore';
   reasons: string[];
   followUpQuestions: string[];
   memoryNotes?: string;
+  biasSnapshot: DecisionBias;
 }
 
 export interface DecisionLogEntry {
   timestamp: number;
-  reasoning: ReasoningResult;
+  proposal: Proposal;
   decision: Decision;
   explanation: string;
 }
@@ -28,10 +29,6 @@ interface DecisionBias {
   questioningBias: number; // positive = more inquisitive
   lastUpdated: number;
 }
-
-// Placeholder for the local reasoning function (LLM-backed) – treated as a black box.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-declare function reasonAboutMessage(input: string, memoryContext: any): ReasoningResult;
 
 const decisionHistory: DecisionLogEntry[] = [];
 const decisionBias: DecisionBias = {
@@ -48,21 +45,32 @@ const recentSimilarDecision = (summary: string): DecisionLogEntry | undefined =>
   return decisionHistory
     .slice(-5)
     .reverse()
-    .find((entry) => entry.reasoning.summaryOfChange.toLowerCase().includes(normalizedSummary));
+    .find((entry) => entry.proposal.summaryOfChange.toLowerCase().includes(normalizedSummary));
 };
 
-const shouldStore = (reasoning: ReasoningResult, past: DecisionLogEntry | undefined) => {
-  const adjustedAmbiguity = Math.min(1, Math.max(0, reasoning.ambiguity - decisionBias.ambiguityToleranceBias));
-  const clarityScore = reasoning.confidence * (1 - adjustedAmbiguity);
+const shouldApply = (
+  proposal: Proposal,
+  past: DecisionLogEntry | undefined,
+  contextSignals: { memoryStrength: number; identityConfidence: number }
+) => {
+  const adjustedAmbiguity = Math.min(1, Math.max(0, proposal.ambiguityEstimate - decisionBias.ambiguityToleranceBias));
+  const baseClarity = proposal.confidenceEstimate * (1 - adjustedAmbiguity);
+  const evidenceLift = (contextSignals.memoryStrength - 0.5) * 0.2 + (contextSignals.identityConfidence - 0.5) * 0.2;
   const historicalSupport = past ? 0.1 : 0;
   const clarityThreshold = Math.min(0.9, Math.max(0.5, 0.7 + decisionBias.clarityThresholdBias));
-  return clarityScore + historicalSupport >= clarityThreshold;
+  return baseClarity + evidenceLift + historicalSupport >= clarityThreshold;
 };
 
-const shouldAskQuestions = (reasoning: ReasoningResult, past: DecisionLogEntry | undefined) => {
-  if (reasoning.questionsToAsk.length === 0) return false;
-  const adjustedAmbiguity = Math.min(1, Math.max(0, reasoning.ambiguity - decisionBias.ambiguityToleranceBias));
-  const clarityScore = reasoning.confidence * (1 - adjustedAmbiguity);
+const shouldAskQuestions = (
+  proposal: Proposal,
+  past: DecisionLogEntry | undefined,
+  contextSignals: { memoryStrength: number; identityConfidence: number }
+) => {
+  if (!proposal.followUpQuestions || proposal.followUpQuestions.length === 0) return false;
+  const adjustedAmbiguity = Math.min(1, Math.max(0, proposal.ambiguityEstimate - decisionBias.ambiguityToleranceBias));
+  const baseClarity = proposal.confidenceEstimate * (1 - adjustedAmbiguity);
+  const evidenceLift = (contextSignals.memoryStrength - 0.5) * 0.2 + (contextSignals.identityConfidence - 0.5) * 0.2;
+  const clarityScore = baseClarity + evidenceLift;
   const redundantInquiry = past && past.decision.followUpQuestions.length > 0;
   const questioningThreshold = Math.min(0.9, Math.max(0.5, 0.7 + decisionBias.questioningBias));
   return clarityScore < questioningThreshold && !redundantInquiry;
@@ -91,8 +99,8 @@ const recordBiasAdjustment = (note: string) => {
 };
 
 const detectSimilar = (a: DecisionLogEntry, b: DecisionLogEntry) => {
-  const aSummary = a.reasoning.summaryOfChange.toLowerCase();
-  const bSummary = b.reasoning.summaryOfChange.toLowerCase();
+  const aSummary = a.proposal.summaryOfChange.toLowerCase();
+  const bSummary = b.proposal.summaryOfChange.toLowerCase();
   return aSummary.includes(bSummary) || bSummary.includes(aSummary);
 };
 
@@ -203,62 +211,73 @@ const biasAwareExplanation = (base: string) => {
 
 export const getDecisionBiasSnapshot = () => ({ ...decisionBias });
 
-export const decideNextActions = (reasoning: ReasoningResult): Decision => {
+export const decideOnProposal = (
+  proposal: Proposal,
+  contextSignals: { memoryStrength?: number; identityConfidence?: number } = {}
+): Decision => {
   adjustDecisionBias();
-  const past = recentSimilarDecision(reasoning.summaryOfChange);
+  const normalizedSignals = {
+    memoryStrength: typeof contextSignals.memoryStrength === 'number' ? contextSignals.memoryStrength : 0.5,
+    identityConfidence: typeof contextSignals.identityConfidence === 'number' ? contextSignals.identityConfidence : 0.5
+  };
+  const past = recentSimilarDecision(proposal.summaryOfChange);
 
-  if (shouldStore(reasoning, past)) {
+  if (shouldApply(proposal, past, normalizedSignals)) {
     const decision: Decision = {
-      action: 'storeMemory',
+      action: 'apply',
       reasons: [
-        `Clarity score suggests the update is well understood (${reasoning.confidence.toFixed(2)} confidence, ${reasoning.ambiguity.toFixed(2)} ambiguity).`,
-        past ? 'Recent similar decision reduced uncertainty.' : 'No conflicting history found.'
+        `Clarity score suggests the update is well understood (${proposal.confidenceEstimate.toFixed(2)} confidence, ${proposal.ambiguityEstimate.toFixed(2)} ambiguity).`,
+        past ? 'Recent similar decision reduced uncertainty.' : 'No conflicting history found.',
+        `Context signals (memory strength ${normalizedSignals.memoryStrength.toFixed(2)}, identity confidence ${normalizedSignals.identityConfidence.toFixed(2)}) nudged acceptance.`
       ],
       followUpQuestions: [],
-      memoryNotes: reasoning.suggestedEffects.join('; ')
+      memoryNotes: proposal.suggestedEffects.join('; '),
+      biasSnapshot: { ...decisionBias }
     };
     decisionHistory.push({
       timestamp: Date.now(),
-      reasoning,
+      proposal,
       decision,
       explanation: biasAwareExplanation(
-        `Information is stable enough to persist; avoiding redundant questions. (Clarity threshold: ${(0.7 + decisionBias.clarityThresholdBias).toFixed(2)})`
+        `Information is stable enough to apply; subtle self-signals reinforced the choice. (Clarity threshold: ${(0.7 + decisionBias.clarityThresholdBias).toFixed(2)})`
       )
     });
     return decision;
   }
 
-  if (shouldAskQuestions(reasoning, past)) {
+  if (shouldAskQuestions(proposal, past, normalizedSignals)) {
     const decision: Decision = {
       action: 'askClarifyingQuestions',
       reasons: [
-        `Ambiguity remains (${reasoning.ambiguity.toFixed(2)}) and clarity score is low, so more details are needed.`,
+        `Ambiguity remains (${proposal.ambiguityEstimate.toFixed(2)}) and clarity score is low, so more details are needed.`,
         'No recent confirmations exist, so clarification is worthwhile.'
       ],
-      followUpQuestions: reasoning.questionsToAsk
+      followUpQuestions: proposal.followUpQuestions || [],
+      biasSnapshot: { ...decisionBias }
     };
     decisionHistory.push({
       timestamp: Date.now(),
-      reasoning,
+      proposal,
       decision,
       explanation: biasAwareExplanation(
-        `Seek clarity before storing to prevent noisy memories. (Questioning threshold: ${(0.7 + decisionBias.questioningBias).toFixed(2)})`
+        `Seek clarity before applying effects to prevent noisy memories. (Questioning threshold: ${(0.7 + decisionBias.questioningBias).toFixed(2)})`
       )
     });
     return decision;
   }
 
   const decision: Decision = {
-    action: 'noAction',
+    action: proposal.confidenceEstimate < 0.25 ? 'ignore' : 'defer',
     reasons: [
-      'Confidence and ambiguity do not justify storage yet.',
+      'Confidence and ambiguity do not justify application yet.',
       past ? 'Past decisions already considered similar information.' : 'Waiting for a clearer signal.'
     ],
-    followUpQuestions: []
+    followUpQuestions: [],
+    biasSnapshot: { ...decisionBias }
   };
   decisionHistory.push({
     timestamp: Date.now(),
-    reasoning,
+    proposal,
     decision,
     explanation: biasAwareExplanation(
       `Conserve cognitive effort until stronger evidence arrives. (Caution bias: ${decisionBias.clarityThresholdBias.toFixed(2)})`
@@ -267,17 +286,20 @@ export const decideNextActions = (reasoning: ReasoningResult): Decision => {
   return decision;
 };
 
-export const runExampleFlow = async (message: string, memoryContext: any, persistMemory: (note: string) => void) => {
-  const reasoning = reasonAboutMessage(message, memoryContext);
-  const decision = decideNextActions(reasoning);
+export const runExampleFlow = async (
+  proposal: Proposal,
+  memoryContext: { memoryStrength?: number; identityConfidence?: number },
+  persistMemory: (note: string) => void
+) => {
+  const decision = decideOnProposal(proposal, memoryContext);
 
-  if (decision.action === 'storeMemory') {
-    persistMemory(decision.memoryNotes || reasoning.summaryOfChange);
+  if (decision.action === 'apply') {
+    persistMemory(decision.memoryNotes || proposal.summaryOfChange);
   }
 
   if (decision.action === 'askClarifyingQuestions') {
-    console.log('Questions to ask before storing:', decision.followUpQuestions);
+    console.log('Questions to ask before applying:', decision.followUpQuestions);
   }
 
-  return { reasoning, decision };
+  return { proposal, decision };
 };
