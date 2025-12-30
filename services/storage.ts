@@ -46,7 +46,7 @@ export const initializeStorage = async () => {
 
 export const getSettings = (): LLMSettings => {
   return load<LLMSettings>(STORAGE_KEYS.SETTINGS, {
-    provider: 'auto',
+    provider: 'local',
     executionMode: 'auto',
     ollamaUrl: '',
     ollamaModel: '',
@@ -55,7 +55,7 @@ export const getSettings = (): LLMSettings => {
     enableSimulation: false,
     orinMode: true,
     travelMode: false,
-    cloud_disabled: false,
+    cloud_disabled: true,
     decision_log_ttl_days: 1,
     max_writes_per_minute: 60,
     recall_sensitivity: 0.8,
