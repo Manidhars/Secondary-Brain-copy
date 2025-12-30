@@ -1,3 +1,5 @@
+import { recordBiasDriftSnapshot } from './storage';
+
 export interface ReasoningResult {
   summaryOfChange: string;
   confidence: number; // 0-1
@@ -185,6 +187,13 @@ const adjustDecisionBias = () => {
   }
 
   decisionBias.lastUpdated = Date.now();
+  recordBiasDriftSnapshot({
+    timestamp: decisionBias.lastUpdated,
+    clarityThresholdBias: decisionBias.clarityThresholdBias,
+    ambiguityToleranceBias: decisionBias.ambiguityToleranceBias,
+    questioningBias: decisionBias.questioningBias,
+    notes: [...biasAdjustmentNotes]
+  });
 };
 
 const biasAwareExplanation = (base: string) => {

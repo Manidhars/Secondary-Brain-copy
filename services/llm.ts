@@ -861,6 +861,8 @@ export const consultBrain = async (
 ) => {
   const startTime = Date.now();
   const settings = getSettings();
+  const concernTraces = deriveConcernThemes();
+  const messageConcern = scoreConcernAlignment(currentMessage, concernTraces);
 
   const automation = handleLocalAutomations(currentMessage);
   if (automation) {
@@ -891,6 +893,11 @@ export const consultBrain = async (
   let searchSpace = memories.filter(m =>
       m.cluster === settings.active_cluster && m.status === 'active'
   );
+
+  const concernLift = (memory: Memory) => {
+      const signal = scoreConcernAlignment(`${memory.content} ${memory.metadata?.topic || ''}`, concernTraces);
+      return 1 + signal.alignment * 0.35;
+  };
 
   if (folderScopes.length > 0) {
       const scoped = searchSpace.filter(m => {
@@ -933,7 +940,19 @@ export const consultBrain = async (
     : 'Local-only mode: no cached memories matched; consider adding more context.';
 
   const replyBody = candidates.map(c => `• ${c.content}`).join("\n");
-  const assembledReply = [replyHeader, replyBody].filter(Boolean).join("\n\n");
+  const reflection =
+    messageConcern.alignment > 0.55 && candidates.length > 0 && !/\?/g.test(currentMessage)
+      ? `This aligns with something you often reinforce: ${messageConcern.topConcern?.description}. Does that sound right?`
+      : '';
+  const assembledReply = [replyHeader, replyBody, reflection].filter(Boolean).join("\n\n");
+
+  if (reflection && messageConcern.topConcern?.description) {
+    reinforceConcernTrace(messageConcern.topConcern.description, 'Surfaced as a persistent concern to confirm understanding');
+  }
+
+  const decisionAssumptions = reflection && messageConcern.topConcern?.description
+    ? [`This touchpoint matches a recurring concern: ${messageConcern.topConcern.description}`]
+    : [];
 
   saveDecisionLog({
     timestamp: Date.now(),
@@ -946,7 +965,7 @@ export const consultBrain = async (
     decision_reason: 'Local provider selected (no API key / cloud disabled).',
     retrieval_latency_ms: Date.now() - startTime,
     cognitive_load: candidates.length / 10,
-    assumptions: []
+    assumptions: decisionAssumptions
   });
 
   candidates.forEach(c => trackMemoryAccess(c.id, 'Used in assembled reply'));
@@ -954,7 +973,7 @@ export const consultBrain = async (
       reply: assembledReply || 'Local-only mode active. No relevant memories yet.',
       explanation: 'Local provider responded without cloud inference.',
       citations: candidates.map(c => c.id),
-      assumptions: []
+      assumptions: decisionAssumptions
   };
 };
 
