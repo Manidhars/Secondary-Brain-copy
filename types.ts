@@ -152,6 +152,8 @@ export interface Person {
   facts: PersonFact[];
   consent_given: boolean; // New: Governance
   lastUpdated: string;
+  identityConfidence?: number;
+  mergedInto?: string;
 }
 
 export interface Reminder {
@@ -208,6 +210,8 @@ export interface PendingPersonDecision {
   matchedPersonId?: string;
   fact: string;
   createdAt: string;
+  candidates?: { personId: string; confidence: number; evidence: string[] }[];
+  lastPrompt?: string;
 }
 
 export interface TranscriptionLog {

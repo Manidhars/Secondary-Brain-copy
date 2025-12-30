@@ -192,6 +192,8 @@ const biasAwareExplanation = (base: string) => {
   return `${base} Bias shifts: ${biasAdjustmentNotes.join(' ')}`;
 };
 
+export const getDecisionBiasSnapshot = () => ({ ...decisionBias });
+
 export const decideNextActions = (reasoning: ReasoningResult): Decision => {
   adjustDecisionBias();
   const past = recentSimilarDecision(reasoning.summaryOfChange);
