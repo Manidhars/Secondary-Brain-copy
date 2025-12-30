@@ -23,9 +23,31 @@ import {
   splitIdentityHypothesis
 } from "./storage";
 import { localTranscribe } from './whisper';
-import { getDecisionBiasSnapshot } from "./cognitiveEngine";
+import { getDecisionBiasSnapshot, decideOnProposal, Proposal } from "./cognitiveEngine";
 
 export { localTranscribe };
+
+type AutomationEffect = {
+    reply: string;
+    explanation: string;
+    citations: string[];
+    assumptions?: string[];
+    reminderId?: string;
+};
+
+type ProposalPacket = {
+    label: string;
+    proposal: Proposal;
+    contextSignals?: { memoryStrength?: number; identityConfidence?: number };
+    apply: () => AutomationEffect;
+    onClarify?: () => AutomationEffect;
+    onDefer?: () => AutomationEffect;
+};
+
+type AutomationBundle = {
+    immediate: AutomationEffect[];
+    proposals: ProposalPacket[];
+};
 
 const deriveDueTime = (timeFragment: string): string => {
     const now = new Date();
@@ -166,7 +188,7 @@ const interpretIdentityFeedback = (message: string) => {
     };
 };
 
-const handleReminderIntent = (message: string) => {
+const handleReminderIntent = (message: string): ProposalPacket | null => {
     if (!/remind\s+me/i.test(message)) return null;
 
     const timeSegmentMatch = message.match(/at\s+([^,.;]+)|in\s+\d+\s+(minutes?|hours?)/i);
@@ -184,31 +206,57 @@ const handleReminderIntent = (message: string) => {
         task = existing[0]?.task || 'task';
     }
 
-    const reminder = upsertReminder(task, dueTime, false);
     const reminderFolder = /work|manager|project/i.test(message) ? 'work/reminders' : 'personal/reminders';
+    const proposal: Proposal = {
+        summaryOfChange: `Schedule reminder '${task}' for ${new Date(dueTime).toLocaleString()}`,
+        suggestedEffects: [`Create reminder '${task}' due ${dueTime}`, `Store task memory in ${reminderFolder}`],
+        confidenceEstimate: task ? 0.82 : 0.65,
+        ambiguityEstimate: task ? 0.18 : 0.32,
+        followUpQuestions: task ? [] : [
+            `I inferred the reminder task as "${task || 'task'}" for ${new Date(dueTime).toLocaleString()}. Is that correct?`
+        ]
+    };
 
-    const memory = addMemory({
-        content: `Reminder: ${task} at ${new Date(dueTime).toLocaleString()}`,
-        domain: /work/.test(reminderFolder) ? 'work' : 'personal',
-        type: 'task',
-        entity: 'self',
-        justification: 'User requested reminder',
-        metadata: {
-            folder: reminderFolder,
-            table: 'reminders',
-            topic: task.slice(0, 80),
-            owner: 'self',
-            origin: 'reminder'
-        }
+    const apply = (): AutomationEffect => {
+        const reminder = upsertReminder(task, dueTime, false);
+        const memory = addMemory({
+            content: `Reminder: ${task} at ${new Date(dueTime).toLocaleString()}`,
+            domain: /work/.test(reminderFolder) ? 'work' : 'personal',
+            type: 'task',
+            entity: 'self',
+            justification: 'User requested reminder',
+            metadata: {
+                folder: reminderFolder,
+                table: 'reminders',
+                topic: task.slice(0, 80),
+                owner: 'self',
+                origin: 'reminder'
+            }
+        });
+
+        return {
+            reply: `Scheduled "${task}" for ${new Date(dueTime).toLocaleString()}. I'll keep it synced if you change it.`,
+            explanation: 'Added to local reminders with auto-updates enabled after cognitive approval.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Task stored locally; will reschedule when asked.'],
+            reminderId: reminder.id
+        };
+    };
+
+    const onClarify = (): AutomationEffect => ({
+        reply: proposal.followUpQuestions?.[0] || `Should I set a reminder for "${task}" at ${new Date(dueTime).toLocaleString()}?`,
+        explanation: 'Decision engine requested confirmation before storing the reminder.',
+        citations: [],
+        assumptions: ['Pending reminder will be stored after clarification.']
     });
 
     return {
-        reply: `Scheduled "${task}" for ${new Date(dueTime).toLocaleString()}. I'll keep it synced if you change it.`,
-        explanation: 'Added to local reminders with auto-updates enabled.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Task stored locally; will reschedule when asked.'],
-        reminderId: reminder.id
-    } as const;
+        label: 'reminder-proposal',
+        proposal,
+        contextSignals: { memoryStrength: 0.58, identityConfidence: 0.56 },
+        apply,
+        onClarify
+    };
 };
 
 const handleHardcodedQuestion = (message: string) => {
@@ -232,7 +280,7 @@ const handleHardcodedQuestion = (message: string) => {
     } as const;
 };
 
-const handlePreferenceCapture = (message: string) => {
+const handlePreferenceCapture = (message: string): ProposalPacket | null => {
     if (message.includes('?')) return null;
     const preferenceMatch = message.match(/i\s+(like|love|prefer|enjoy)\s+([^.!]+)/i);
     if (!preferenceMatch) return null;
@@ -240,59 +288,93 @@ const handlePreferenceCapture = (message: string) => {
     const sentiment = preferenceMatch[1];
     const subject = preferenceMatch[2].trim();
 
-    const memory = addMemory({
-        content: `Preference noted: you ${sentiment} ${subject}.`,
-        domain: 'personal',
-        type: 'preference',
-        entity: 'self',
-        justification: 'Direct user statement',
-        metadata: {
-            folder: 'personal/self/preferences',
-            table: 'preferences',
-            topic: subject,
-            owner: 'self',
-            origin: 'preference'
-        }
-    });
+    const proposal: Proposal = {
+        summaryOfChange: `Capture preference: you ${sentiment} ${subject}`,
+        suggestedEffects: [`Store preference for ${subject} under personal/self/preferences`],
+        confidenceEstimate: 0.78,
+        ambiguityEstimate: 0.14,
+        followUpQuestions: []
+    };
+
+    const apply = (): AutomationEffect => {
+        const memory = addMemory({
+            content: `Preference noted: you ${sentiment} ${subject}.`,
+            domain: 'personal',
+            type: 'preference',
+            entity: 'self',
+            justification: 'Direct user statement',
+            metadata: {
+                folder: 'personal/self/preferences',
+                table: 'preferences',
+                topic: subject,
+                owner: 'self',
+                origin: 'preference'
+            }
+        });
+
+        return {
+            reply: `Captured that you ${sentiment} ${subject} in your personal preferences folder.`,
+            explanation: 'Stored under personal/self/preferences for quick recall after decision approval.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Future questions about you will prioritize this folder.']
+        };
+    };
 
     return {
-        reply: `Captured that you ${sentiment} ${subject} in your personal preferences folder.`,
-        explanation: 'Stored under personal/self/preferences for quick recall.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Future questions about you will prioritize this folder.']
-    } as const;
+        label: 'preference-proposal',
+        proposal,
+        contextSignals: { memoryStrength: 0.6, identityConfidence: 0.62 },
+        apply
+    };
 };
 
-const handleFriendFact = (message: string) => {
+const handleFriendFact = (message: string): ProposalPacket | null => {
     if (!/my\s+friend/i.test(message) || message.includes('?')) return null;
     const friendMatch = message.match(/my\s+friend\s+([a-z]+)/i);
     const name = friendMatch?.[1] || 'friend';
     const folder = `personal/friends/${name.toLowerCase()}`;
 
-    const memory = addMemory({
-        content: message.trim(),
-        domain: 'personal',
-        type: 'fact',
-        entity: name,
-        justification: 'User shared detail about a friend',
-        metadata: {
-            folder,
-            table: 'facts',
-            topic: name,
-            owner: 'friend',
-            origin: 'manual'
-        }
-    });
+    const proposal: Proposal = {
+        summaryOfChange: `Capture friend fact about ${name}`,
+        suggestedEffects: [`Store friend detail in ${folder}`],
+        confidenceEstimate: 0.74,
+        ambiguityEstimate: 0.22,
+        followUpQuestions: []
+    };
+
+    const apply = (): AutomationEffect => {
+        const memory = addMemory({
+            content: message.trim(),
+            domain: 'personal',
+            type: 'fact',
+            entity: name,
+            justification: 'User shared detail about a friend',
+            metadata: {
+                folder,
+                table: 'facts',
+                topic: name,
+                owner: 'friend',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Logged this under My Friends → ${name}.`,
+            explanation: 'Created/updated a friend folder for targeted recall after decision approval.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Friend context will be prioritized when you ask about them.']
+        };
+    };
 
     return {
-        reply: `Logged this under My Friends → ${name}.`,
-        explanation: 'Created/updated a friend folder for targeted recall.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Friend context will be prioritized when you ask about them.']
-    } as const;
+        label: 'friend-fact-proposal',
+        proposal,
+        contextSignals: { memoryStrength: 0.55, identityConfidence: 0.58 },
+        apply
+    };
 };
 
-const handleSelfFact = (message: string) => {
+const handleSelfFact = (message: string): ProposalPacket | null => {
     if (message.includes('?')) return null;
     const factMatch = message.match(/\b(i am|i'm|my name is|i live in|i (?:work|worked) at|i was born in|i have|i got)\b\s+([^.!?]+)/i);
     if (!factMatch) return null;
@@ -300,30 +382,47 @@ const handleSelfFact = (message: string) => {
     const verb = factMatch[1];
     const detail = factMatch[2].trim();
 
-    const memory = addMemory({
-        content: `Self fact: ${verb} ${detail}`,
-        domain: 'personal',
-        type: 'fact',
-        entity: 'self',
-        justification: 'User shared a personal fact',
-        metadata: {
-            folder: 'personal/self/facts',
-            table: 'facts',
-            topic: detail.slice(0, 80),
-            owner: 'self',
-            origin: 'manual'
-        }
-    });
+    const proposal: Proposal = {
+        summaryOfChange: `Capture self fact: ${verb} ${detail}`,
+        suggestedEffects: ['Store self fact under personal/self/facts'],
+        confidenceEstimate: 0.76,
+        ambiguityEstimate: 0.18,
+        followUpQuestions: []
+    };
+
+    const apply = (): AutomationEffect => {
+        const memory = addMemory({
+            content: `Self fact: ${verb} ${detail}`,
+            domain: 'personal',
+            type: 'fact',
+            entity: 'self',
+            justification: 'User shared a personal fact',
+            metadata: {
+                folder: 'personal/self/facts',
+                table: 'facts',
+                topic: detail.slice(0, 80),
+                owner: 'self',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Captured this about you: ${verb} ${detail}.`,
+            explanation: 'Stored under personal/self/facts for fast recall like a personal brain after decision approval.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Future questions about you will surface this first.']
+        };
+    };
 
     return {
-        reply: `Captured this about you: ${verb} ${detail}.`,
-        explanation: 'Stored under personal/self/facts for fast recall like a personal brain.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Future questions about you will surface this first.']
-    } as const;
+        label: 'self-fact-proposal',
+        proposal,
+        contextSignals: { memoryStrength: 0.63, identityConfidence: 0.65 },
+        apply
+    };
 };
 
-const handleRelationshipFact = (message: string) => {
+const handleRelationshipFact = (message: string): ProposalPacket | null => {
     if (message.includes('?')) return null;
 
     const directRelation = message.match(/\bmy\s+(friend|brother|sister|mother|father|mom|dad|cousin|partner|wife|husband)\s+([a-z]+)/i);
@@ -335,27 +434,44 @@ const handleRelationshipFact = (message: string) => {
     if (!relation || !name) return null;
 
     const folder = `personal/relationships/${name.toLowerCase()}`;
-    const memory = addMemory({
-        content: `${name} is your ${relation}. ${message.trim()}`,
-        domain: 'personal',
-        type: 'fact',
-        entity: name,
-        justification: 'User described a relationship',
-        metadata: {
-            folder,
-            table: 'relationships',
-            topic: `${name} (${relation})`,
-            owner: 'friend',
-            origin: 'manual'
-        }
-    });
+    const proposal: Proposal = {
+        summaryOfChange: `Capture relationship fact: ${name} is your ${relation}`,
+        suggestedEffects: [`Store relationship detail in ${folder}`],
+        confidenceEstimate: 0.75,
+        ambiguityEstimate: 0.2,
+        followUpQuestions: []
+    };
+
+    const apply = (): AutomationEffect => {
+        const memory = addMemory({
+            content: `${name} is your ${relation}. ${message.trim()}`,
+            domain: 'personal',
+            type: 'fact',
+            entity: name,
+            justification: 'User described a relationship',
+            metadata: {
+                folder,
+                table: 'relationships',
+                topic: `${name} (${relation})`,
+                owner: 'friend',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Noted that ${name} is your ${relation}. I've organized it under relationships for you.`,
+            explanation: 'Relationship details were filed under personal/relationships for human-like recall after decision approval.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Friend and family context will be recalled before general info.']
+        };
+    };
 
     return {
-        reply: `Noted that ${name} is your ${relation}. I've organized it under relationships for you.`,
-        explanation: 'Relationship details were filed under personal/relationships for human-like recall.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Friend and family context will be recalled before general info.']
-    } as const;
+        label: 'relationship-fact-proposal',
+        proposal,
+        contextSignals: { memoryStrength: 0.6, identityConfidence: 0.6 },
+        apply
+    };
 };
 
 const extractProjectName = (message: string) => {
@@ -396,65 +512,94 @@ const classifyProjectDecision = (message: string): 'same' | 'new' | null => {
     return null;
 };
 
-const handlePendingProjectDecision = (message: string) => {
+
+const handlePendingProjectDecision = (message: string): ProposalPacket | null => {
     const pending = getPendingProjectDecision();
     if (!pending) return null;
 
     const decision = classifyProjectDecision(message);
     if (!decision) return null;
 
-    savePendingProjectDecision(null);
+    const proposal: Proposal = {
+        summaryOfChange: decision === 'same'
+            ? `Confirm reuse of existing project ${pending.projectName}`
+            : `Create distinct project node for ${pending.projectName}`,
+        suggestedEffects: decision === 'same'
+            ? ['Reinforce existing project memory', 'Keep project context unified']
+            : ['Branch project context into a new node'],
+        confidenceEstimate: 0.68,
+        ambiguityEstimate: 0.24,
+        followUpQuestions: []
+    };
 
-    if (decision === 'same') {
-        if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId, 'Project confirmation reused memory');
-        const reinforcement = addMemory({
-            content: `Confirmed continuation of existing project "${pending.projectName}".`,
+    const apply = (): AutomationEffect => {
+        savePendingProjectDecision(null);
+        if (decision === 'same') {
+            if (pending.existingMemoryId) trackMemoryAccess(pending.existingMemoryId, 'Project confirmation reused memory');
+            const reinforcement = addMemory({
+                content: `Confirmed continuation of existing project "${pending.projectName}".`,
+                domain: 'work',
+                type: 'event',
+                entity: pending.projectName,
+                justification: 'User confirmed existing project node reuse.',
+                metadata: {
+                    folder: `work/projects/${pending.slug || uniqueSlug(pending.projectName)}`,
+                    table: 'projects',
+                    topic: pending.projectName,
+                    owner: 'work',
+                    origin: 'manual'
+                }
+            });
+
+            return {
+                reply: `Got it — continuing with your existing "${pending.projectName}" project node.`,
+                explanation: 'Keeping all updates tied to the original project memory after cognitive approval.',
+                citations: [pending.existingMemoryId, reinforcement?.id].filter(Boolean) as string[],
+                assumptions: ['You prefer to reuse the existing project graph.']
+            };
+        }
+
+        const slug = pending.slug || uniqueSlug(pending.projectName);
+        const memory = addMemory({
+            content: `Parallel project node created for "${pending.projectName}" after user requested separation.`,
             domain: 'work',
-            type: 'event',
+            type: 'task',
             entity: pending.projectName,
-            justification: 'User confirmed existing project node reuse.',
+            justification: 'User indicated this is a different project with the same name.',
             metadata: {
-                folder: `work/projects/${pending.slug || uniqueSlug(pending.projectName)}`,
+                folder: `work/projects/${slug}`,
                 table: 'projects',
-                topic: pending.projectName,
+                topic: `${pending.projectName} (${slug})`,
                 owner: 'work',
                 origin: 'manual'
             }
         });
 
         return {
-            reply: `Got it — continuing with your existing "${pending.projectName}" project node.`,
-            explanation: 'Keeping all updates tied to the original project memory.',
-            citations: [pending.existingMemoryId, reinforcement?.id].filter(Boolean) as string[],
-            assumptions: ['You prefer to reuse the existing project graph.']
-        } as const;
-    }
+            reply: `Started a separate project thread for "${pending.projectName}" (${slug}). I'll keep it independent from the earlier node.`,
+            explanation: 'Created a new local project node to avoid merging contexts.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Treat project updates as a distinct effort.']
+        };
+    };
 
-    const slug = uniqueSlug(pending.projectName);
-    const memory = addMemory({
-        content: `Parallel project node created for "${pending.projectName}" after user requested separation.`,
-        domain: 'work',
-        type: 'task',
-        entity: pending.projectName,
-        justification: 'User indicated this is a different project with the same name.',
-        metadata: {
-            folder: `work/projects/${slug}`,
-            table: 'projects',
-            topic: `${pending.projectName} (${slug})`,
-            owner: 'work',
-            origin: 'manual'
-        }
+    const onDefer = (): AutomationEffect => ({
+        reply: 'I held the project decision until the signal is clearer.',
+        explanation: 'Decision engine deferred branching until more evidence arrives.',
+        citations: [],
+        assumptions: ['Pending project choice remains queued.']
     });
 
     return {
-        reply: `Started a separate project thread for "${pending.projectName}" (${slug}). I'll keep it independent from the earlier node.`,
-        explanation: 'Created a new local project node to avoid merging contexts.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Treat project updates as a distinct effort.']
-    } as const;
+        label: 'pending-project-decision',
+        proposal,
+        contextSignals: { memoryStrength: 0.62, identityConfidence: 0.58 },
+        apply,
+        onDefer
+    };
 };
 
-const handlePendingPersonDecision = (message: string) => {
+const handlePendingPersonDecision = (message: string): ProposalPacket | null => {
     const pending = getPendingPersonDecision();
     if (!pending) return null;
 
@@ -474,68 +619,115 @@ const handlePendingPersonDecision = (message: string) => {
     const fallbackPerson = pending.matchedPersonId ? people.find(p => p.id === pending.matchedPersonId) : null;
     const topCandidate = candidates[0] || (fallbackPerson ? { person: fallbackPerson, confidence: fallbackPerson.identityConfidence ?? 0.6, evidence: [] } : null);
 
-    savePendingPersonDecision(null);
+    let mode: 'merge' | 'reinforce' | 'split' | 'new' = 'new';
+    if (feedback.mergeSignal && candidates.length >= 2) mode = 'merge';
+    else if (topCandidate?.person && !feedback.correctionSignal) mode = 'reinforce';
+    else if (topCandidate?.person && feedback.correctionSignal) mode = 'split';
 
-    if (feedback.mergeSignal && candidates.length >= 2) {
-        mergeIdentities(candidates[0].person.id, candidates[1].person.id, 'User signaled these are the same identity');
+    const summaryMap = {
+        merge: `Merge identities for ${candidates[0]?.person.name} and ${candidates[1]?.person.name}`,
+        reinforce: `Reinforce identity match for ${topCandidate?.person.name}`,
+        split: `Create new hypothesis for ${pending.name} after correction`,
+        new: `Start new identity hypothesis for ${pending.name}`
+    } as const;
+
+    const proposal: Proposal = {
+        summaryOfChange: summaryMap[mode],
+        suggestedEffects: [
+            mode === 'merge' ? 'Merge overlapping identities' : 'Store fact to person profile',
+            mode === 'split' || mode === 'new' ? 'Adjust identity confidence to reflect correction' : 'Reinforce identity confidence'
+        ],
+        confidenceEstimate: mode === 'merge' ? 0.7 : 0.65,
+        ambiguityEstimate: feedback.detailProvided ? 0.18 : 0.28,
+        followUpQuestions: []
+    };
+
+    const apply = (): AutomationEffect => {
+        savePendingPersonDecision(null);
+        if (mode === 'merge' && candidates.length >= 2) {
+            mergeIdentities(candidates[0].person.id, candidates[1].person.id, 'User signaled these are the same identity');
+            const memory = addMemory({
+                content: `Merged identities: ${candidates[0].person.name} with ${candidates[1].person.name}.`,
+                domain: 'personal',
+                type: 'fact',
+                entity: candidates[0].person.name,
+                justification: 'User indicated these references match.',
+                metadata: {
+                    folder: 'personal/relationships',
+                    table: 'relationships',
+                    topic: `${candidates[0].person.name} merge`,
+                    owner: 'friend',
+                    origin: 'manual'
+                }
+            });
+
+            return {
+                reply: `Combined ${candidates[0].person.name} and ${candidates[1].person.name} as the same person and kept their facts together.`,
+                explanation: 'Merged overlapping identities with a reversible snapshot.',
+                citations: [memory?.id].filter(Boolean) as string[],
+                assumptions: ['Revertible via identity event log if needed.']
+            };
+        }
+
+        if (mode === 'reinforce' && topCandidate?.person) {
+            addFactToPerson(topCandidate.person.id, fact, 'user');
+            reinforceIdentity(topCandidate.person.id, feedback.detailProvided ? 'User elaborated without contradiction' : 'User confirmed identity match');
+            const memory = addMemory({
+                content: `Person ${topCandidate.person.name}: ${fact}`,
+                domain: 'personal',
+                type: 'fact',
+                entity: topCandidate.person.name,
+                justification: feedback.detailProvided ? 'User reinforced this identity with more detail.' : 'User confirmed this identity.',
+                metadata: {
+                    folder: `personal/relationships/${topCandidate.person.name.toLowerCase()}`,
+                    table: 'relationships',
+                    topic: `${topCandidate.person.name} (${topCandidate.person.relation})`,
+                    owner: 'friend',
+                    origin: 'manual'
+                }
+            });
+
+            return {
+                reply: `Linked this to ${topCandidate.person.name} with confidence ${(topCandidate.confidence || 0.5).toFixed(2)} and noted: ${fact}.`,
+                explanation: 'Identity confidence nudged upward after your confirmation.',
+                citations: [memory?.id].filter(Boolean) as string[],
+                assumptions: ['Future mentions will bias toward this node unless corrected.']
+            };
+        }
+
+        if (mode === 'split' && topCandidate?.person) {
+            weakenIdentity(topCandidate.person.id, 'User corrected an identity link', true);
+            const branched = splitIdentityHypothesis(topCandidate.person.id, pending.name, fact, 'Identity confidence fell low after correction');
+            const memory = addMemory({
+                content: `New identity hypothesis for ${pending.name}: ${fact}`,
+                domain: 'personal',
+                type: 'fact',
+                entity: pending.name,
+                justification: 'User indicated prior match was wrong, so a new hypothesis was created.',
+                metadata: {
+                    folder: `personal/relationships/${pending.name.toLowerCase()}`,
+                    table: 'relationships',
+                    topic: pending.name,
+                    owner: 'friend',
+                    origin: 'manual'
+                }
+            });
+
+            return {
+                reply: `Created a fresh identity hypothesis for ${pending.name} and lowered confidence on the previous candidate. Logged: ${fact}.`,
+                explanation: 'Correction applied; confidence reduced and a new node formed to keep contexts separate.',
+                citations: [memory?.id].filter(Boolean) as string[],
+                assumptions: ['Tell me if this new node also needs to merge later.']
+            };
+        }
+
+        updatePerson(pending.name, fact, 'Acquaintance');
         const memory = addMemory({
-            content: `Merged identities: ${candidates[0].person.name} with ${candidates[1].person.name}.`,
-            domain: 'personal',
-            type: 'fact',
-            entity: candidates[0].person.name,
-            justification: 'User indicated these references match.',
-            metadata: {
-                folder: 'personal/relationships',
-                table: 'relationships',
-                topic: `${candidates[0].person.name} merge`,
-                owner: 'friend',
-                origin: 'manual'
-            }
-        });
-
-        return {
-            reply: `Combined ${candidates[0].person.name} and ${candidates[1].person.name} as the same person and kept their facts together.`,
-            explanation: 'Merged overlapping identities with a reversible snapshot.',
-            citations: [memory?.id].filter(Boolean) as string[],
-            assumptions: ['Revertible via identity event log if needed.']
-        } as const;
-    }
-
-    if (topCandidate?.person && !feedback.correctionSignal) {
-        addFactToPerson(topCandidate.person.id, fact, 'user');
-        reinforceIdentity(topCandidate.person.id, feedback.detailProvided ? 'User elaborated without contradiction' : 'User confirmed identity match');
-        const memory = addMemory({
-            content: `Person ${topCandidate.person.name}: ${fact}`,
-            domain: 'personal',
-            type: 'fact',
-            entity: topCandidate.person.name,
-            justification: feedback.detailProvided ? 'User reinforced this identity with more detail.' : 'User confirmed this identity.',
-            metadata: {
-                folder: `personal/relationships/${topCandidate.person.name.toLowerCase()}`,
-                table: 'relationships',
-                topic: `${topCandidate.person.name} (${topCandidate.person.relation})`,
-                owner: 'friend',
-                origin: 'manual'
-            }
-        });
-
-        return {
-            reply: `Linked this to ${topCandidate.person.name} with confidence ${(topCandidate.confidence || 0.5).toFixed(2)} and noted: ${fact}.`,
-            explanation: 'Identity confidence nudged upward after your confirmation.',
-            citations: [memory?.id].filter(Boolean) as string[],
-            assumptions: ['Future mentions will bias toward this node unless corrected.']
-        } as const;
-    }
-
-    if (topCandidate?.person && feedback.correctionSignal) {
-        weakenIdentity(topCandidate.person.id, 'User corrected an identity link', true);
-        const branched = splitIdentityHypothesis(topCandidate.person.id, pending.name, fact, 'Identity confidence fell low after correction');
-        const memory = addMemory({
-            content: `New identity hypothesis for ${pending.name}: ${fact}`,
+            content: `New person ${pending.name}: ${fact}`,
             domain: 'personal',
             type: 'fact',
             entity: pending.name,
-            justification: 'User indicated prior match was wrong, so a new hypothesis was created.',
+            justification: 'New identity hypothesis created after mention.',
             metadata: {
                 folder: `personal/relationships/${pending.name.toLowerCase()}`,
                 table: 'relationships',
@@ -546,39 +738,22 @@ const handlePendingPersonDecision = (message: string) => {
         });
 
         return {
-            reply: `Created a fresh identity hypothesis for ${pending.name} and lowered confidence on the previous candidate. Logged: ${fact}.`,
-            explanation: 'Correction applied; confidence reduced and a new node formed to keep contexts separate.',
+            reply: `Started a new identity hypothesis for ${pending.name} and logged: ${fact}.`,
+            explanation: 'No strong candidate remained, so a fresh node was added.',
             citations: [memory?.id].filter(Boolean) as string[],
-            assumptions: ['Tell me if this new node also needs to merge later.']
-        } as const;
-    }
-
-    // If no candidate existed, create a new hypothesis and store.
-    updatePerson(pending.name, fact, 'Acquaintance');
-    const memory = addMemory({
-        content: `New person ${pending.name}: ${fact}`,
-        domain: 'personal',
-        type: 'fact',
-        entity: pending.name,
-        justification: 'New identity hypothesis created after mention.',
-        metadata: {
-            folder: `personal/relationships/${pending.name.toLowerCase()}`,
-            table: 'relationships',
-            topic: pending.name,
-            owner: 'friend',
-            origin: 'manual'
-        }
-    });
+            assumptions: ['I will keep adjusting confidence as you add or correct facts.']
+        };
+    };
 
     return {
-        reply: `Started a new identity hypothesis for ${pending.name} and logged: ${fact}.`,
-        explanation: 'No strong candidate remained, so a fresh node was added.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['I will keep adjusting confidence as you add or correct facts.']
-    } as const;
+        label: 'pending-person-decision',
+        proposal,
+        contextSignals: { memoryStrength: 0.6, identityConfidence: topCandidate?.confidence || 0.55 },
+        apply
+    };
 };
 
-const handlePersonEncounter = (message: string) => {
+const handlePersonEncounter = (message: string): ProposalPacket | null => {
     const encounter = extractPersonEncounter(message);
     if (!encounter) return null;
 
@@ -588,73 +763,125 @@ const handlePersonEncounter = (message: string) => {
     const topCandidate = candidates[0];
 
     if (topCandidate && topCandidate.confidence >= 0.72 && !shouldClarify) {
-        addFactToPerson(topCandidate.person.id, encounter.fact, 'user');
-        reinforceIdentity(topCandidate.person.id, 'Identity matched without objection');
-        const memory = addMemory({
-            content: `Person ${topCandidate.person.name}: ${encounter.fact}`,
-            domain: 'personal',
-            type: 'fact',
-            entity: topCandidate.person.name,
-            justification: 'High-confidence match to existing identity.',
-            metadata: {
-                folder: `personal/relationships/${topCandidate.person.name.toLowerCase()}`,
-                table: 'relationships',
-                topic: `${topCandidate.person.name} (${topCandidate.person.relation})`,
-                owner: 'friend',
-                origin: 'manual'
-            }
-        });
+        const proposal: Proposal = {
+            summaryOfChange: `Reinforce identity for ${topCandidate.person.name}`,
+            suggestedEffects: ['Attach encounter fact to person', 'Reinforce identity confidence'],
+            confidenceEstimate: topCandidate.confidence,
+            ambiguityEstimate: 0.18,
+            followUpQuestions: []
+        };
+
+        const apply = (): AutomationEffect => {
+            addFactToPerson(topCandidate.person.id, encounter.fact, 'user');
+            reinforceIdentity(topCandidate.person.id, 'Identity matched without objection');
+            const memory = addMemory({
+                content: `Person ${topCandidate.person.name}: ${encounter.fact}`,
+                domain: 'personal',
+                type: 'fact',
+                entity: topCandidate.person.name,
+                justification: 'High-confidence match to existing identity.',
+                metadata: {
+                    folder: `personal/relationships/${topCandidate.person.name.toLowerCase()}`,
+                    table: 'relationships',
+                    topic: `${topCandidate.person.name} (${topCandidate.person.relation})`,
+                    owner: 'friend',
+                    origin: 'manual'
+                }
+            });
+            return {
+                reply: `I linked this to ${topCandidate.person.name} and noted: ${encounter.fact}.`,
+                explanation: 'Confidence was high and bias was low, so I reinforced the existing identity without extra questions.',
+                citations: [memory?.id].filter(Boolean) as string[],
+                assumptions: ['Tell me if this should be separated and I will lower confidence.']
+            };
+        };
+
         return {
-            reply: `I linked this to ${topCandidate.person.name} and noted: ${encounter.fact}.`,
-            explanation: 'Confidence was high and bias was low, so I reinforced the existing identity without extra questions.',
-            citations: [memory?.id].filter(Boolean) as string[],
-            assumptions: ['Tell me if this should be separated and I will lower confidence.']
-        } as const;
+            label: 'person-encounter',
+            proposal,
+            contextSignals: { memoryStrength: 0.62, identityConfidence: topCandidate.confidence },
+            apply
+        };
     }
 
     if (!topCandidate || topCandidate.confidence < 0.35) {
-        const newPerson = splitIdentityHypothesis(topCandidate?.person.id || 'unlinked', encounter.name, encounter.fact, 'No strong identity candidate matched');
-        const memory = addMemory({
-            content: `New identity hypothesis for ${encounter.name}: ${encounter.fact}`,
-            domain: 'personal',
-            type: 'fact',
-            entity: encounter.name,
-            justification: 'No confident match; created a fresh hypothesis.',
-            metadata: {
-                folder: `personal/relationships/${encounter.name.toLowerCase()}`,
-                table: 'relationships',
-                topic: encounter.name,
-                owner: 'friend',
-                origin: 'manual'
-            }
-        });
+        const proposal: Proposal = {
+            summaryOfChange: `Create new identity hypothesis for ${encounter.name}`,
+            suggestedEffects: ['Start new person record', 'Capture encounter fact'],
+            confidenceEstimate: 0.48,
+            ambiguityEstimate: 0.32,
+            followUpQuestions: []
+        };
+
+        const apply = (): AutomationEffect => {
+            const newPerson = splitIdentityHypothesis(topCandidate?.person.id || 'unlinked', encounter.name, encounter.fact, 'No strong identity candidate matched');
+            const memory = addMemory({
+                content: `New identity hypothesis for ${encounter.name}: ${encounter.fact}`,
+                domain: 'personal',
+                type: 'fact',
+                entity: encounter.name,
+                justification: 'No confident match; created a fresh hypothesis.',
+                metadata: {
+                    folder: `personal/relationships/${encounter.name.toLowerCase()}`,
+                    table: 'relationships',
+                    topic: encounter.name,
+                    owner: 'friend',
+                    origin: 'manual'
+                }
+            });
+            return {
+                reply: `I created a new identity hypothesis for ${encounter.name} (starting confidence ${(newPerson.identityConfidence || 0.45).toFixed(2)}). Logged: ${encounter.fact}.`,
+                explanation: 'No candidate was confident enough, so a fresh node was created with low initial confidence.',
+                citations: [memory?.id].filter(Boolean) as string[],
+                assumptions: ['Confidence will rise or fall as you confirm or correct future mentions.']
+            };
+        };
+
         return {
-            reply: `I created a new identity hypothesis for ${encounter.name} (starting confidence ${(newPerson.identityConfidence || 0.45).toFixed(2)}). Logged: ${encounter.fact}.`,
-            explanation: 'No candidate was confident enough, so a fresh node was created with low initial confidence.',
-            citations: [memory?.id].filter(Boolean) as string[],
-            assumptions: ['Confidence will rise or fall as you confirm or correct future mentions.']
-        } as const;
+            label: 'person-encounter-new-identity',
+            proposal,
+            contextSignals: { memoryStrength: 0.55, identityConfidence: topCandidate?.confidence || 0.35 },
+            apply
+        };
     }
 
-    savePendingPersonDecision({
-        name: encounter.name,
-        matchedPersonId: topCandidate.person.id,
-        fact: encounter.fact,
-        createdAt: new Date().toISOString(),
-        candidates: candidates.map(c => ({ personId: c.person.id, confidence: c.confidence, evidence: c.evidence })),
-        lastPrompt: 'identity_clarification'
-    });
-
     const clarification = buildIdentityQuestion(candidates, encounter.name);
+    const proposal: Proposal = {
+        summaryOfChange: `Clarify which ${encounter.name} this encounter refers to`,
+        suggestedEffects: ['Ask clarifying question before updating identity'],
+        confidenceEstimate: topCandidate?.confidence || 0.55,
+        ambiguityEstimate: 0.42,
+        followUpQuestions: [clarification]
+    };
+
+    const onClarify = (): AutomationEffect => {
+        savePendingPersonDecision({
+            name: encounter.name,
+            matchedPersonId: topCandidate?.person.id,
+            fact: encounter.fact,
+            createdAt: new Date().toISOString(),
+            candidates: candidates.map(c => ({ personId: c.person.id, confidence: c.confidence, evidence: c.evidence })),
+            lastPrompt: 'identity_clarification'
+        });
+
+        return {
+            reply: clarification,
+            explanation: 'Top candidates shared similar context cues and current bias favors caution, so I asked before reinforcing.',
+            citations: [],
+            assumptions: ['Your next message will nudge identity confidence up or down.']
+        };
+    };
+
     return {
-        reply: clarification,
-        explanation: 'Top candidates shared similar context cues and current bias favors caution, so I asked before reinforcing.',
-        citations: [],
-        assumptions: ['Your next message will nudge identity confidence up or down.']
-    } as const;
+        label: 'person-encounter-clarify',
+        proposal,
+        contextSignals: { memoryStrength: 0.56, identityConfidence: topCandidate?.confidence || 0.5 },
+        apply: onClarify,
+        onClarify
+    };
 };
 
-const handleProjectIntent = (message: string) => {
+const handleProjectIntent = (message: string): ProposalPacket | null => {
     const projectName = extractProjectName(message);
     if (!projectName) return null;
 
@@ -667,53 +894,142 @@ const handleProjectIntent = (message: string) => {
 
     if (existing.length > 0) {
         const memory = existing[0];
-        trackMemoryAccess(memory.id, 'Matched existing project node');
-        savePendingProjectDecision({
-            projectName: normalized,
-            existingMemoryId: memory.id,
-            slug,
-            createdAt: new Date().toISOString()
-        });
+        const question = `I already have a project named "${normalized}" in your graph. Is this the same effort or a separate project with the same name?`;
+        const proposal: Proposal = {
+            summaryOfChange: `Clarify whether project ${normalized} matches existing node`,
+            suggestedEffects: ['Ask before reusing or branching project node'],
+            confidenceEstimate: 0.52,
+            ambiguityEstimate: 0.46,
+            followUpQuestions: [question]
+        };
+
+        const onClarify = (): AutomationEffect => {
+            trackMemoryAccess(memory.id, 'Matched existing project node');
+            savePendingProjectDecision({
+                projectName: normalized,
+                existingMemoryId: memory.id,
+                slug,
+                createdAt: new Date().toISOString()
+            });
+            return {
+                reply: question,
+                explanation: 'Matched an existing project node; requesting clarification before branching the workstream.',
+                citations: [memory.id],
+                assumptions: ['Awaiting your confirmation before creating a new project node.']
+            };
+        };
+
         return {
-            reply: `I already have a project named "${normalized}" in your graph. Is this the same effort or a separate project with the same name?`,
-            explanation: 'Matched an existing project node; requesting clarification before branching the workstream.',
-            citations: [memory.id],
-            assumptions: ['Awaiting your confirmation before creating a new project node.']
-        } as const;
+            label: 'project-intent-clarify',
+            proposal,
+            contextSignals: { memoryStrength: memory.strength || 0.58, identityConfidence: 0.6 },
+            apply: onClarify,
+            onClarify
+        };
     }
 
-    const memory = addMemory({
-        content: `Project node created for "${normalized}". User is currently working on it.`,
-        domain: 'work',
-        type: 'task',
-        entity: normalized,
-        justification: 'User declared an active project.',
-        metadata: {
-            folder: `work/projects/${slug}`,
-            table: 'projects',
-            topic: normalized,
-            owner: 'work',
-            origin: 'manual'
-        }
-    });
+    const proposal: Proposal = {
+        summaryOfChange: `Create new project ${normalized}`,
+        suggestedEffects: ['Add project memory node'],
+        confidenceEstimate: 0.77,
+        ambiguityEstimate: 0.18,
+        followUpQuestions: []
+    };
+
+    const apply = (): AutomationEffect => {
+        const memory = addMemory({
+            content: `Project node created for "${normalized}". User is currently working on it.`,
+            domain: 'work',
+            type: 'task',
+            entity: normalized,
+            justification: 'User declared an active project.',
+            metadata: {
+                folder: `work/projects/${slug}`,
+                table: 'projects',
+                topic: normalized,
+                owner: 'work',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Logged a new project called "${normalized}" in your work graph and created a fresh node for it.`,
+            explanation: 'New project node added locally for future recall and linking.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Project stored locally; no cloud calls used.']
+        };
+    };
 
     return {
-        reply: `Logged a new project called "${normalized}" in your work graph and created a fresh node for it.`,
-        explanation: 'New project node added locally for future recall and linking.',
-        citations: [memory?.id].filter(Boolean) as string[],
-        assumptions: ['Project stored locally; no cloud calls used.']
-    } as const;
+        label: 'project-intent-new',
+        proposal,
+        contextSignals: { memoryStrength: 0.64, identityConfidence: 0.6 },
+        apply
+    };
+};
+const combineEffects = (effects: AutomationEffect[]): AutomationEffect => {
+    if (effects.length === 1) return effects[0];
+
+    const combinedReply = effects.map(a => `• ${a.reply}`).join("\n");
+    const combinedExplanation = effects.map(a => a.explanation).join(' ');
+    const combinedCitations = Array.from(new Set(effects.flatMap(a => a.citations)));
+    const combinedAssumptions = Array.from(new Set(effects.flatMap(a => a.assumptions || [])));
+
+    return {
+        reply: combinedReply,
+        explanation: combinedExplanation,
+        citations: combinedCitations,
+        assumptions: combinedAssumptions
+    };
 };
 
-const handleLocalAutomations = (message: string) => {
+const evaluateProposalDecision = (packet: ProposalPacket, query: string, startedAt: number): AutomationEffect | null => {
+    const decision = decideOnProposal(packet.proposal, packet.contextSignals);
+    const reasoning = `${packet.label}: ${decision.reasons.join(' ')}`;
+
+    saveDecisionLog({
+        timestamp: Date.now(),
+        query,
+        memory_retrieval_used: false,
+        memories_considered: 0,
+        memories_injected: 0,
+        cloud_called: false,
+        decision_reason: `${reasoning} (bias clarity ${decision.biasSnapshot.clarityThresholdBias.toFixed(2)})`,
+        retrieval_latency_ms: Date.now() - startedAt,
+        cognitive_load: 0.12,
+        assumptions: packet.proposal.followUpQuestions && packet.proposal.followUpQuestions.length > 0 ? ['Awaiting clarification before action.'] : []
+    });
+
+    if (decision.action === 'apply') return packet.apply();
+    if (decision.action === 'askClarifyingQuestions') return packet.onClarify ? packet.onClarify() : {
+        reply: decision.followUpQuestions.join(' '),
+        explanation: 'Decision engine requested clarification before applying effects.',
+        citations: [],
+        assumptions: ['Pending response will guide storage.']
+    };
+    if (decision.action === 'defer') return packet.onDefer ? packet.onDefer() : {
+        reply: 'I will hold this until more context arrives.',
+        explanation: 'Decision engine deferred action to reduce noise.',
+        citations: [],
+        assumptions: ['No state change performed.']
+    };
+
+    return null;
+};
+
+const handleLocalAutomations = (message: string): AutomationBundle => {
+    const bundle: AutomationBundle = { immediate: [], proposals: [] };
+
     const pendingProject = handlePendingProjectDecision(message);
-    if (pendingProject) return pendingProject;
+    if (pendingProject) bundle.proposals.push(pendingProject);
 
     const pendingPerson = handlePendingPersonDecision(message);
-    if (pendingPerson) return pendingPerson;
+    if (pendingPerson) bundle.proposals.push(pendingPerson);
 
-    const automations = [
-        handleHardcodedQuestion(message),
+    const hardcoded = handleHardcodedQuestion(message);
+    if (hardcoded) bundle.immediate.push(hardcoded);
+
+    [
         handlePersonEncounter(message),
         handleProjectIntent(message),
         handleReminderIntent(message),
@@ -721,27 +1037,11 @@ const handleLocalAutomations = (message: string) => {
         handleSelfFact(message),
         handleRelationshipFact(message),
         handleFriendFact(message)
-    ].filter(Boolean) as {
-        reply: string;
-        explanation: string;
-        citations: string[];
-        assumptions?: string[];
-    }[];
+    ].forEach(candidate => {
+        if (candidate) bundle.proposals.push(candidate as ProposalPacket);
+    });
 
-    if (automations.length === 0) return null;
-    if (automations.length === 1) return automations[0];
-
-    const combinedReply = automations.map(a => `• ${a.reply}`).join("\n");
-    const combinedExplanation = automations.map(a => a.explanation).join(' ');
-    const combinedCitations = Array.from(new Set(automations.flatMap(a => a.citations)));
-    const combinedAssumptions = Array.from(new Set(automations.flatMap(a => a.assumptions || [])));
-
-    return {
-        reply: combinedReply,
-        explanation: combinedExplanation,
-        citations: combinedCitations,
-        assumptions: combinedAssumptions
-    } as const;
+    return bundle;
 };
 
 export const isApiConfigured = () => {
@@ -865,7 +1165,13 @@ export const consultBrain = async (
   const messageConcern = scoreConcernAlignment(currentMessage, concernTraces);
 
   const automation = handleLocalAutomations(currentMessage);
-  if (automation) {
+  const automationEffects: AutomationEffect[] = [...automation.immediate];
+  automation.proposals.forEach(packet => {
+      const outcome = evaluateProposalDecision(packet, currentMessage, startTime);
+      if (outcome) automationEffects.push(outcome);
+  });
+
+  if (automationEffects.length > 0) {
       saveDecisionLog({
         timestamp: Date.now(),
         query: currentMessage,
@@ -873,17 +1179,18 @@ export const consultBrain = async (
         memories_considered: 0,
         memories_injected: 0,
         cloud_called: false,
-        decision_reason: 'Handled by local automation (reminder/folder/preference).',
+        decision_reason: 'Handled by cognitive proposal flow before retrieval.',
         retrieval_latency_ms: Date.now() - startTime,
-        cognitive_load: 0.1,
-        assumptions: automation.assumptions || []
+        cognitive_load: 0.12,
+        assumptions: automationEffects.flatMap(a => a.assumptions || [])
       });
 
+      const combined = combineEffects(automationEffects);
       return {
-        reply: automation.reply,
-        explanation: automation.explanation,
-        citations: automation.citations,
-        assumptions: automation.assumptions
+        reply: combined.reply,
+        explanation: combined.explanation,
+        citations: combined.citations,
+        assumptions: combined.assumptions
       };
   }
   
