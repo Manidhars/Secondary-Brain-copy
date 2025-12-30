@@ -1,5 +1,5 @@
 import { Memory, Place, Reminder, MemoryType, MemoryDomain, DecisionLog, TranscriptSegment } from "../types";
-import { getSettings, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, addMemory, upsertReminder, getReminders, getMemoriesInFolder, getPendingProjectDecision, savePendingProjectDecision } from "./storage";
+import { getSettings, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, addMemory, upsertReminder, getReminders, getMemoriesInFolder, getPendingProjectDecision, savePendingProjectDecision, getPeople, addFactToPerson, savePendingPersonDecision, getPendingPersonDecision, updatePerson } from "./storage";
 import { localTranscribe } from './whisper';
 
 export { localTranscribe };
@@ -42,6 +42,30 @@ const detectFolderScopes = (message: string): string[] => {
     if (/(work|manager|project|meeting|sprint)/i.test(message)) scopes.push('work');
     if (lower.includes('remind')) scopes.push('work/reminders');
     return scopes;
+};
+
+const extractPersonEncounter = (message: string): { name: string; fact: string } | null => {
+    const metMatch = message.match(/\bmet\s+([A-Za-z]+)/i);
+    const spokeMatch = message.match(/\b(?:spoke with|talked to|saw|meeting with|met with)\s+([A-Za-z]+)/i);
+
+    const name = metMatch?.[1] || spokeMatch?.[1];
+    if (!name) return null;
+
+    return { name, fact: message.trim() };
+};
+
+const classifyPersonDecision = (message: string): 'same' | 'new' | null => {
+    const lower = message.toLowerCase();
+    if (/(same|yes|yeah|yep|correct|existing|that one)/i.test(lower)) return 'same';
+    if (/(new|different|another|create|not the same|no|someone else)/i.test(lower)) return 'new';
+    return null;
+};
+
+const normalizeFact = (pendingFact: string, followUp: string) => {
+    const trimmed = followUp.trim();
+    const isBareAck = /^(yes|yeah|yep|no|new|same|correct|different|another)/i.test(trimmed) && trimmed.split(/\s+/).length <= 3;
+    if (!trimmed || isBareAck) return pendingFact;
+    return `${pendingFact} ${trimmed}`.trim();
 };
 
 const handleReminderIntent = (message: string) => {
@@ -311,6 +335,99 @@ const handlePendingProjectDecision = (message: string) => {
     } as const;
 };
 
+const handlePendingPersonDecision = (message: string) => {
+    const pending = getPendingPersonDecision();
+    if (!pending) return null;
+
+    const decision = classifyPersonDecision(message);
+    if (!decision) return null;
+
+    const people = getPeople();
+    const person = pending.matchedPersonId ? people.find(p => p.id === pending.matchedPersonId) : null;
+    const fact = normalizeFact(pending.fact, message);
+
+    savePendingPersonDecision(null);
+
+    if (decision === 'same' && person) {
+        addFactToPerson(person.id, fact, 'user');
+        const memory = addMemory({
+            content: `Person ${pending.name}: ${fact}`,
+            domain: 'personal',
+            type: 'fact',
+            entity: pending.name,
+            justification: 'User confirmed this matches an existing person node.',
+            metadata: {
+                folder: `personal/relationships/${pending.name.toLowerCase()}`,
+                table: 'relationships',
+                topic: `${pending.name} (${person.relation})`,
+                owner: 'friend',
+                origin: 'manual'
+            }
+        });
+
+        return {
+            reply: `Linked this update to ${pending.name}'s existing node and noted: ${fact}.`,
+            explanation: 'Existing person graph updated with the new encounter fact.',
+            citations: [memory?.id].filter(Boolean) as string[],
+            assumptions: ['Future mentions of this name will use the same entity unless you tell me otherwise.']
+        } as const;
+    }
+
+    updatePerson(pending.name, fact, 'Acquaintance');
+    const memory = addMemory({
+        content: `New person ${pending.name}: ${fact}`,
+        domain: 'personal',
+        type: 'fact',
+        entity: pending.name,
+        justification: 'User requested a new person node after disambiguation.',
+        metadata: {
+            folder: `personal/relationships/${pending.name.toLowerCase()}`,
+            table: 'relationships',
+            topic: pending.name,
+            owner: 'friend',
+            origin: 'manual'
+        }
+    });
+
+    return {
+        reply: `Created a new node for ${pending.name} and logged: ${fact}. Tell me more to enrich it.`,
+        explanation: 'New person captured after you asked to branch from any existing contacts.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Additional facts will keep this node grounded locally.']
+    } as const;
+};
+
+const handlePersonEncounter = (message: string) => {
+    const encounter = extractPersonEncounter(message);
+    if (!encounter) return null;
+
+    const people = getPeople();
+    const existing = people.find(p => p.name.toLowerCase() === encounter.name.toLowerCase());
+
+    savePendingPersonDecision({
+        name: encounter.name,
+        matchedPersonId: existing?.id,
+        fact: encounter.fact,
+        createdAt: new Date().toISOString()
+    });
+
+    if (existing) {
+        return {
+            reply: `You mentioned ${encounter.name}. Is this the same ${encounter.name} you already track (${existing.relation}) or someone new?`,
+            explanation: 'Detected a person mention and need confirmation before updating the graph.',
+            citations: [],
+            assumptions: ['Waiting for your confirmation before writing to the person node.']
+        } as const;
+    }
+
+    return {
+        reply: `Want me to create a new person node for ${encounter.name}? Share a bit more and I'll store it.`,
+        explanation: 'No existing contact matched; awaiting your go-ahead to create a fresh node.',
+        citations: [],
+        assumptions: ['Will persist locally once you confirm.']
+    } as const;
+};
+
 const handleProjectIntent = (message: string) => {
     const projectName = extractProjectName(message);
     if (!projectName) return null;
@@ -366,7 +483,11 @@ const handleLocalAutomations = (message: string) => {
     const pendingProject = handlePendingProjectDecision(message);
     if (pendingProject) return pendingProject;
 
+    const pendingPerson = handlePendingPersonDecision(message);
+    if (pendingPerson) return pendingPerson;
+
     const automations = [
+        handlePersonEncounter(message),
         handleProjectIntent(message),
         handleReminderIntent(message),
         handlePreferenceCapture(message),
