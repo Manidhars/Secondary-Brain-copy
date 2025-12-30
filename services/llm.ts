@@ -38,6 +38,7 @@ const detectFolderScopes = (message: string): string[] => {
     if (friendMatch?.[1]) scopes.push(`personal/friends/${friendMatch[1].toLowerCase()}`);
     if (lower.includes('friend')) scopes.push('personal/friends');
     if (/(about\s+me|about\s+myself|i\s+)/i.test(message)) scopes.push('personal/self');
+    if (/(family|brother|sister|mom|dad|mother|father|partner|wife|husband)/i.test(message)) scopes.push('personal/relationships');
     if (/(work|manager|project|meeting|sprint)/i.test(message)) scopes.push('work');
     if (lower.includes('remind')) scopes.push('work/reminders');
     return scopes;
@@ -145,6 +146,72 @@ const handleFriendFact = (message: string) => {
         explanation: 'Created/updated a friend folder for targeted recall.',
         citations: [memory?.id].filter(Boolean) as string[],
         assumptions: ['Friend context will be prioritized when you ask about them.']
+    } as const;
+};
+
+const handleSelfFact = (message: string) => {
+    if (message.includes('?')) return null;
+    const factMatch = message.match(/\b(i am|i'm|my name is|i live in|i (?:work|worked) at|i was born in|i have|i got)\b\s+([^.!?]+)/i);
+    if (!factMatch) return null;
+
+    const verb = factMatch[1];
+    const detail = factMatch[2].trim();
+
+    const memory = addMemory({
+        content: `Self fact: ${verb} ${detail}`,
+        domain: 'personal',
+        type: 'fact',
+        entity: 'self',
+        justification: 'User shared a personal fact',
+        metadata: {
+            folder: 'personal/self/facts',
+            table: 'facts',
+            topic: detail.slice(0, 80),
+            owner: 'self',
+            origin: 'manual'
+        }
+    });
+
+    return {
+        reply: `Captured this about you: ${verb} ${detail}.`,
+        explanation: 'Stored under personal/self/facts for fast recall like a personal brain.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Future questions about you will surface this first.']
+    } as const;
+};
+
+const handleRelationshipFact = (message: string) => {
+    if (message.includes('?')) return null;
+
+    const directRelation = message.match(/\bmy\s+(friend|brother|sister|mother|father|mom|dad|cousin|partner|wife|husband)\s+([a-z]+)/i);
+    const reverseRelation = message.match(/\b([A-Z][a-z]+)\s+is\s+my\s+(friend|brother|sister|mother|father|mom|dad|cousin|partner|wife|husband)/i);
+
+    const relation = directRelation?.[1] || reverseRelation?.[2];
+    const name = directRelation?.[2] || reverseRelation?.[1];
+
+    if (!relation || !name) return null;
+
+    const folder = `personal/relationships/${name.toLowerCase()}`;
+    const memory = addMemory({
+        content: `${name} is your ${relation}. ${message.trim()}`,
+        domain: 'personal',
+        type: 'fact',
+        entity: name,
+        justification: 'User described a relationship',
+        metadata: {
+            folder,
+            table: 'relationships',
+            topic: `${name} (${relation})`,
+            owner: 'friend',
+            origin: 'manual'
+        }
+    });
+
+    return {
+        reply: `Noted that ${name} is your ${relation}. I've organized it under relationships for you.`,
+        explanation: 'Relationship details were filed under personal/relationships for human-like recall.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Friend and family context will be recalled before general info.']
     } as const;
 };
 
@@ -299,19 +366,34 @@ const handleLocalAutomations = (message: string) => {
     const pendingProject = handlePendingProjectDecision(message);
     if (pendingProject) return pendingProject;
 
-    const project = handleProjectIntent(message);
-    if (project) return project;
+    const automations = [
+        handleProjectIntent(message),
+        handleReminderIntent(message),
+        handlePreferenceCapture(message),
+        handleSelfFact(message),
+        handleRelationshipFact(message),
+        handleFriendFact(message)
+    ].filter(Boolean) as {
+        reply: string;
+        explanation: string;
+        citations: string[];
+        assumptions?: string[];
+    }[];
 
-    const reminder = handleReminderIntent(message);
-    if (reminder) return reminder;
+    if (automations.length === 0) return null;
+    if (automations.length === 1) return automations[0];
 
-    const preference = handlePreferenceCapture(message);
-    if (preference) return preference;
+    const combinedReply = automations.map(a => `• ${a.reply}`).join("\n");
+    const combinedExplanation = automations.map(a => a.explanation).join(' ');
+    const combinedCitations = Array.from(new Set(automations.flatMap(a => a.citations)));
+    const combinedAssumptions = Array.from(new Set(automations.flatMap(a => a.assumptions || [])));
 
-    const friendFact = handleFriendFact(message);
-    if (friendFact) return friendFact;
-
-    return null;
+    return {
+        reply: combinedReply,
+        explanation: combinedExplanation,
+        citations: combinedCitations,
+        assumptions: combinedAssumptions
+    } as const;
 };
 
 export const isApiConfigured = () => {
