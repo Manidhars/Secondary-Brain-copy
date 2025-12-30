@@ -18,7 +18,8 @@ export interface Memory {
   salience: number;
   trust_score: number;
   confidence_history: number[];
-  status: MemoryStatus; 
+  strength?: number;
+  status: MemoryStatus;
   recall_priority: RecallPriority;
   supersedes: string | null;
   source_hash: string; 
