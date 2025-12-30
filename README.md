@@ -22,3 +22,4 @@ View your app in AI Studio: https://ai.studio/apps/drive/1xbQTfFLX1fMGrqcNRk39-c
 3. Run the app:
    `npm run dev`
 4. Choose your provider in **Settings → LLM Provider** (Auto/local-first default; Gemini or Mistral used when keys exist).
+5. Local automations: reminders, self preferences, friend facts, and meeting transcripts are auto-organized into folders (`personal/self`, `personal/friends/{name}`, `work/calls`) so the chat agent can answer from your data even without cloud calls.

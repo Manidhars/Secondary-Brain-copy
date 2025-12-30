@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type, Tool } from "@google/genai";
 import { Memory, Place, Person, Reminder, LLMProvider, LLMSettings, MemoryType, MemoryDomain, DecisionLog, TranscriptSegment } from "../types";
-import { getSettings, getUserProfile, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, updateMemory, deleteMemory, addMemory, addTranscriptionLog } from "./storage";
+import { getSettings, getUserProfile, trackMemoryAccess, saveDecisionLog, getMemories, getDecisionLogs, updateMemory, deleteMemory, addMemory, addTranscriptionLog, upsertReminder, getReminders, getMemoriesInFolder } from "./storage";
 import { localTranscribe } from './whisper';
 
 export { localTranscribe };
@@ -56,6 +56,163 @@ const resolveProviderConfig = (): ProviderConfig => {
     if (mistralKey) return { provider: 'mistral', apiKey: mistralKey, source: 'auto' };
 
     return { provider: 'local', apiKey: null, source: 'local_only' };
+};
+
+const deriveDueTime = (timeFragment: string): string => {
+    const now = new Date();
+    const lower = timeFragment.trim().toLowerCase();
+    const relative = lower.match(/in\s+(\d+)\s+(minute|minutes|hour|hours)/);
+    if (relative) {
+        const value = parseInt(relative[1], 10);
+        const ms = /hour/.test(relative[2]) ? value * 60 * 60 * 1000 : value * 60 * 1000;
+        return new Date(now.getTime() + ms).toISOString();
+    }
+
+    const timeMatch = lower.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
+    if (!timeMatch) return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+
+    let hour = parseInt(timeMatch[1], 10);
+    const minute = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+    const period = timeMatch[3];
+
+    if (period === 'pm' && hour < 12) hour += 12;
+    if (period === 'am' && hour === 12) hour = 0;
+    if (!period && hour >= 1 && hour <= 7) hour += 12; // assume evening by default
+
+    const due = new Date(now);
+    due.setHours(hour, minute, 0, 0);
+    if (due.getTime() <= now.getTime()) due.setDate(due.getDate() + 1);
+    return due.toISOString();
+};
+
+const detectFolderScopes = (message: string): string[] => {
+    const scopes: string[] = [];
+    const lower = message.toLowerCase();
+    const friendMatch = lower.match(/my friend\s+([a-z]+)/i);
+    if (friendMatch?.[1]) scopes.push(`personal/friends/${friendMatch[1].toLowerCase()}`);
+    if (lower.includes('friend')) scopes.push('personal/friends');
+    if (/(about\s+me|about\s+myself|i\s+)/i.test(message)) scopes.push('personal/self');
+    if (/(work|manager|project|meeting|sprint)/i.test(message)) scopes.push('work');
+    if (lower.includes('remind')) scopes.push('work/reminders');
+    return scopes;
+};
+
+const handleReminderIntent = (message: string) => {
+    if (!/remind\s+me/i.test(message)) return null;
+
+    const timeSegmentMatch = message.match(/at\s+([^,.;]+)|in\s+\d+\s+(minutes?|hours?)/i);
+    const timeSegment = timeSegmentMatch ? timeSegmentMatch[0].replace(/^at\s+/i, '') : 'in 1 hour';
+    const dueTime = deriveDueTime(timeSegment);
+
+    let task = message
+        .replace(/remind\s+me\s+/i, '')
+        .replace(timeSegmentMatch ? timeSegmentMatch[0] : '', '')
+        .replace(/^to\s+/i, '')
+        .trim();
+
+    if (!task) {
+        const existing = getReminders();
+        task = existing[0]?.task || 'task';
+    }
+
+    const reminder = upsertReminder(task, dueTime, false);
+    const reminderFolder = /work|manager|project/i.test(message) ? 'work/reminders' : 'personal/reminders';
+
+    const memory = addMemory({
+        content: `Reminder: ${task} at ${new Date(dueTime).toLocaleString()}`,
+        domain: /work/.test(reminderFolder) ? 'work' : 'personal',
+        type: 'task',
+        entity: 'self',
+        justification: 'User requested reminder',
+        metadata: {
+            folder: reminderFolder,
+            table: 'reminders',
+            topic: task.slice(0, 80),
+            owner: 'self',
+            origin: 'reminder'
+        }
+    });
+
+    return {
+        reply: `Scheduled "${task}" for ${new Date(dueTime).toLocaleString()}. I'll keep it synced if you change it.`,
+        explanation: 'Added to local reminders with auto-updates enabled.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Task stored locally; will reschedule when asked.'],
+        reminderId: reminder.id
+    } as const;
+};
+
+const handlePreferenceCapture = (message: string) => {
+    if (message.includes('?')) return null;
+    const preferenceMatch = message.match(/i\s+(like|love|prefer|enjoy)\s+([^.!]+)/i);
+    if (!preferenceMatch) return null;
+
+    const sentiment = preferenceMatch[1];
+    const subject = preferenceMatch[2].trim();
+
+    const memory = addMemory({
+        content: `Preference noted: you ${sentiment} ${subject}.`,
+        domain: 'personal',
+        type: 'preference',
+        entity: 'self',
+        justification: 'Direct user statement',
+        metadata: {
+            folder: 'personal/self/preferences',
+            table: 'preferences',
+            topic: subject,
+            owner: 'self',
+            origin: 'preference'
+        }
+    });
+
+    return {
+        reply: `Captured that you ${sentiment} ${subject} in your personal preferences folder.`,
+        explanation: 'Stored under personal/self/preferences for quick recall.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Future questions about you will prioritize this folder.']
+    } as const;
+};
+
+const handleFriendFact = (message: string) => {
+    if (!/my\s+friend/i.test(message) || message.includes('?')) return null;
+    const friendMatch = message.match(/my\s+friend\s+([a-z]+)/i);
+    const name = friendMatch?.[1] || 'friend';
+    const folder = `personal/friends/${name.toLowerCase()}`;
+
+    const memory = addMemory({
+        content: message.trim(),
+        domain: 'personal',
+        type: 'fact',
+        entity: name,
+        justification: 'User shared detail about a friend',
+        metadata: {
+            folder,
+            table: 'facts',
+            topic: name,
+            owner: 'friend',
+            origin: 'manual'
+        }
+    });
+
+    return {
+        reply: `Logged this under My Friends → ${name}.`,
+        explanation: 'Created/updated a friend folder for targeted recall.',
+        citations: [memory?.id].filter(Boolean) as string[],
+        assumptions: ['Friend context will be prioritized when you ask about them.']
+    } as const;
+};
+
+const handleLocalAutomations = (message: string) => {
+    const reminder = handleReminderIntent(message);
+    if (reminder) return reminder;
+
+    const preference = handlePreferenceCapture(message);
+    if (preference) return preference;
+
+    const friendFact = handleFriendFact(message);
+    if (friendFact) return friendFact;
+
+    return null;
 };
 
 export const isApiConfigured = () => {
@@ -253,12 +410,48 @@ export const consultBrain = async (
   const settings = getSettings();
   const { provider, apiKey } = resolveProviderConfig();
   const profile = getUserProfile();
+
+  const automation = handleLocalAutomations(currentMessage);
+  if (automation) {
+      saveDecisionLog({
+        timestamp: Date.now(),
+        query: currentMessage,
+        memory_retrieval_used: false,
+        memories_considered: 0,
+        memories_injected: 0,
+        cloud_called: false,
+        decision_reason: 'Handled by local automation (reminder/folder/preference).',
+        retrieval_latency_ms: Date.now() - startTime,
+        cognitive_load: 0.1,
+        assumptions: automation.assumptions || []
+      });
+
+      return {
+        reply: automation.reply,
+        explanation: automation.explanation,
+        citations: automation.citations,
+        assumptions: automation.assumptions
+      };
+  }
   
   const searchQueries = await decomposeUserQuery(currentMessage);
   
-  let searchSpace = memories.filter(m => 
+  const folderScopes = detectFolderScopes(currentMessage);
+  let searchSpace = memories.filter(m =>
       m.cluster === settings.active_cluster && m.status === 'active'
   );
+
+  if (folderScopes.length > 0) {
+      const scoped = searchSpace.filter(m => {
+          const folder = (m.metadata?.folder || '').toLowerCase();
+          return folderScopes.some(scope => folder.startsWith(scope));
+      });
+      if (scoped.length > 0) searchSpace = scoped;
+      if (scoped.length === 0) {
+          const fallback = folderScopes.flatMap(scope => getMemoriesInFolder(scope));
+          if (fallback.length > 0) searchSpace = fallback;
+      }
+  }
   
   const relevantFragments = new Set<Memory>();
   for (const q of searchQueries) {

@@ -42,6 +42,11 @@ export interface Memory {
     last_edit_reason?: string;
     last_sync_at?: string;
     insight_source_ids?: string[];
+    folder?: string;
+    table?: string;
+    topic?: string;
+    owner?: 'self' | 'friend' | 'work' | 'system' | string;
+    origin?: 'manual' | 'transcript' | 'reminder' | 'preference' | 'import';
   };
 }
 
