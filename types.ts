@@ -3,7 +3,7 @@ export type MemoryType = 'fact' | 'decision' | 'preference' | 'constraint' | 'ta
 export type MemoryDomain = 'work' | 'personal' | 'home' | 'health' | 'finance' | 'system' | 'general';
 export type MemoryStatus = 'active' | 'completed' | 'archived' | 'decaying' | 'deprecated' | 'superseded' | 'cold_storage' | 'contradictory';
 export type RecallPriority = 'high' | 'normal' | 'low';
-export type LLMProvider = 'gemini' | 'ollama' | 'anthropic';
+export type LLMProvider = 'auto' | 'local' | 'gemini' | 'ollama' | 'anthropic' | 'mistral';
 export type ConnectionProtocol = 'wired' | 'wifi' | 'ble' | 'cloud';
 export type MemoryCluster = 'main' | 'experimental';
 

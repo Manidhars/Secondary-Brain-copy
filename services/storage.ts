@@ -46,10 +46,10 @@ export const initializeStorage = async () => {
 
 export const getSettings = (): LLMSettings => {
   return load<LLMSettings>(STORAGE_KEYS.SETTINGS, {
-    provider: 'gemini', 
+    provider: 'auto',
     executionMode: 'auto',
     ollamaUrl: '',
-    ollamaModel: '', 
+    ollamaModel: '',
     mcpEnabled: false,
     mcpEndpoint: '',
     enableSimulation: false,
