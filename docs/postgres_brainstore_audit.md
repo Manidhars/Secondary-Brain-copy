@@ -13,9 +13,16 @@ Audit of the custom `PostgresBrainStore` against the baseline `SessionStorageAda
 - **Ignored-memory handling**: Session retrieval calls `registerMemoryIgnored` with non-selected candidates drawn from the filtered search space. The Postgres store recomputes ignored IDs by selecting *all* other rows in the database with the same folder prefix, even if they were already filtered out in-memory (different cluster/status) or were never part of the current search space.【F:services/postgresBrainStore.ts†L127-L143】【F:services/llm.ts†L1346-L1353】
 
 ## Semantics When Vector Search Is Disabled
-- Transcript fallback depends on an embedding input. When `embedding` is omitted, `shouldFallback` can be `true` (no/weak summaries), but transcript queries are skipped, returning only summary matches. The session path always falls back to text-matched transcripts and even creates micro-summaries, so the Postgres store does **not** match the transcript fallback semantics without vectors.【F:services/postgresBrainStore.ts†L112-L125】【F:services/llm.ts†L1218-L1243】
+- Transcript fallback depends on an embedding input. When `embedding` is omitted, `shouldFallback` can be `true` (no/weak summaries), but transcript queries are skipped, returning only summary matches. The session path always falls back to text-matched transcripts and even creates micro-summaries, so the Postgres store does **not** match the transcript fallback semantics without vectors.【F:services/postgresBrainStore.ts†L167-L197】【F:services/llm.ts†L1206-L1243】
 
 - Even with vectors disabled, the Postgres path still requires the `vector` extension at init, which differs from the session adapter’s zero-dependency startup path.【F:services/postgresBrainStore.ts†L30-L48】【F:services/storage.ts†L152-L171】
+
+## Vector-Enabled vs. Non-Vector Retrieval
+- **Ranking surface changes**: With an embedding provided, transcript fallback orders rows purely by vector distance and skips the salience/trust/strength weighting used by the text fallback, so the relative order of transcript candidates diverges from the non-vector path and the session baseline.【F:services/postgresBrainStore.ts†L171-L197】【F:services/llm.ts†L1210-L1238】
+
+- **Query coverage loosened by vectors**: Vector-backed fallback ignores `queries` entirely, allowing transcripts with no lexical overlap to satisfy unresolved queries, whereas the text fallback (and the session planner) require `LOWER(content)` matches via `rankQueryMatches`. This can surface unrelated transcripts or leave queries unresolved despite a triggered fallback.【F:services/postgresBrainStore.ts†L167-L197】【F:services/llm.ts†L1206-L1238】
+
+- **Zero-query behavior diverges**: When `queries` is empty and summaries are missing, the vector path still returns transcripts by similarity, but the non-vector path returns none because it requires `summaryPatterns` for transcript search. The session planner always works from decomposed queries, so the vector path introduces a new retrieval surface absent in the non-vector baseline.【F:services/postgresBrainStore.ts†L167-L197】【F:services/llm.ts†L1136-L1175】
 
 ## Edge Cases That May Diverge
 - **Missing or inconsistent metadata**: Rows lacking `metadata.folder` are invisible to Postgres queries, while session retrieval could still include them if they reside in the in-memory search space filtered by cluster/status.
