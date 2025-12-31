@@ -1,9 +1,100 @@
 import {
-  Memory, Person, Reminder, Place, MemoryType, MemoryDomain, ChatMessage, MemoryStatus,
-  ChatSession, LLMSettings, UserProfile, QueueItem, TranscriptionLog,
-  SmartDevice, Room, ConnectionProtocol, RecallPriority, DecisionLog, PersonFact, TranscriptSegment,
-  PendingProjectDecision, PendingPersonDecision
+  Memory,
+  Person,
+  Reminder,
+  Place,
+  MemoryType,
+  MemoryDomain,
+  ChatMessage,
+  MemoryStatus,
+  ChatSession,
+  LLMSettings,
+  UserProfile,
+  QueueItem,
+  TranscriptionLog,
+  SmartDevice,
+  Room,
+  ConnectionProtocol,
+  RecallPriority,
+  DecisionLog,
+  PersonFact,
+  TranscriptSegment,
+  PendingProjectDecision,
+  PendingPersonDecision
 } from '../types';
+
+export interface StorageAdapter {
+  initializeStorage: () => Promise<void>;
+  getSettings: () => LLMSettings;
+  saveSettings: (settings: LLMSettings) => Promise<void>;
+  getMemories: () => Memory[];
+  getPendingProjectDecision: () => PendingProjectDecision | null;
+  savePendingProjectDecision: (pending: PendingProjectDecision | null) => void;
+  getPendingPersonDecision: () => PendingPersonDecision | null;
+  savePendingPersonDecision: (pending: PendingPersonDecision | null) => void;
+  addMemory: (params: any) => Memory | null;
+  approveMemory: (id: string) => void;
+  updateMemory: (id: string, updates: Partial<Memory>) => void;
+  deleteMemory: (id: string) => void;
+  getMemoriesInFolder: (folderPrefix: string) => Memory[];
+  trackMemoryAccess: (id: string, reason?: string) => void;
+  registerMemoryIgnored: (ids: string[], reason?: string) => void;
+  getPeople: () => Person[];
+  reinforceIdentity: (personId: string, reason: string) => number | null;
+  weakenIdentity: (personId: string, reason: string, sharp?: boolean) => number | null;
+  mergeIdentities: (
+    targetId: string,
+    sourceId: string,
+    reason: string
+  ) => { mergedInto: Person; snapshot: { target?: Person; source?: Person } } | null;
+  splitIdentityHypothesis: (sourceId: string, newName: string, factStr: string, reason: string) => Person;
+  updatePerson: (name: string, factStr: string, relation?: string) => void;
+  updatePersonConsent: (id: string, consent: boolean) => void;
+  addFactToPerson: (personId: string, content: string, source?: 'user' | 'inferred' | 'system') => void;
+  removeFactFromPerson: (personId: string, factId: string) => void;
+  getReminders: () => Reminder[];
+  upsertReminder: (task: string, dueTime: string, completed?: boolean) => Reminder;
+  completeReminder: (id: string, completed?: boolean) => void;
+  rescheduleReminder: (id: string, dueTime: string) => void;
+  getSessions: () => ChatSession[];
+  createSession: (mode?: 'active' | 'observer') => ChatSession;
+  updateSession: (id: string, messages: ChatMessage[]) => Promise<void>;
+  deleteSession: (id: string) => Promise<void>;
+  getUserProfile: () => UserProfile;
+  saveUserProfile: (profile: UserProfile) => Promise<void>;
+  getQueue: () => QueueItem[];
+  addToQueue: (content: string, type?: any) => Promise<void>;
+  removeFromQueue: (id: string) => Promise<void>;
+  updateQueueItem: (id: string, updates: any) => Promise<void>;
+  getDecisionLogs: () => DecisionLog[];
+  saveDecisionLog: (log: DecisionLog) => Promise<void>;
+  getStorageUsage: () => { usedKB: number; limitKB: number; percent: number };
+  runSystemBootCheck: () => string[];
+  runColdStorageMaintenance: () => void;
+  triggerSync: () => Promise<void>;
+  exportData: () => void;
+  importData: (file: File) => Promise<boolean>;
+  factoryReset: () => void;
+  getTranscriptionLogs: () => TranscriptionLog[];
+  addTranscriptionLog: (
+    content: string,
+    source: 'upload' | 'live',
+    segments?: TranscriptSegment[],
+    options?: { meetingId?: string; participants?: string[]; meetingDate?: string; sourceType?: 'audio' | 'document' }
+  ) => void;
+  deleteTranscriptionLog: (id: string) => Promise<void>;
+  getPlaces: () => Place[];
+  addPlace: (place: Partial<Place>) => void;
+  updatePlaceStatus: (id: string, status: Place['status']) => Promise<void>;
+  deletePlace: (id: string) => Promise<void>;
+  getRooms: () => Room[];
+  addRoom: (name: string, type: string) => Promise<void>;
+  getSmartDevices: () => SmartDevice[];
+  addSmartDevice: (device: Partial<SmartDevice>) => Promise<void>;
+  updateSmartDevice: (id: string, updates: Partial<SmartDevice>) => Promise<void>;
+  deleteSmartDevice: (id: string) => Promise<void>;
+  purgeOldDecisionLogs: () => void;
+}
 
 const STORAGE_KEYS = {
   MEMORIES: 'cliper_memories',
@@ -794,3 +885,67 @@ export const updateSmartDevice = (id: string, updates: Partial<SmartDevice>) => 
 export const deleteSmartDevice = (id: string) => save(STORAGE_KEYS.SMART_DEVICES, getSmartDevices().filter(d => d.id !== id));
 
 export const purgeOldDecisionLogs = () => {};
+
+export const storageAdapter: StorageAdapter = {
+  initializeStorage,
+  getSettings,
+  saveSettings,
+  getMemories,
+  getPendingProjectDecision,
+  savePendingProjectDecision,
+  getPendingPersonDecision,
+  savePendingPersonDecision,
+  addMemory,
+  approveMemory,
+  updateMemory,
+  deleteMemory,
+  getMemoriesInFolder,
+  trackMemoryAccess,
+  registerMemoryIgnored,
+  getPeople,
+  reinforceIdentity,
+  weakenIdentity,
+  mergeIdentities,
+  splitIdentityHypothesis,
+  updatePerson,
+  updatePersonConsent,
+  addFactToPerson,
+  removeFactFromPerson,
+  getReminders,
+  upsertReminder,
+  completeReminder,
+  rescheduleReminder,
+  getSessions,
+  createSession,
+  updateSession,
+  deleteSession,
+  getUserProfile,
+  saveUserProfile,
+  getQueue,
+  addToQueue,
+  removeFromQueue,
+  updateQueueItem,
+  getDecisionLogs,
+  saveDecisionLog,
+  getStorageUsage,
+  runSystemBootCheck,
+  runColdStorageMaintenance,
+  triggerSync,
+  exportData,
+  importData,
+  factoryReset,
+  getTranscriptionLogs,
+  addTranscriptionLog,
+  deleteTranscriptionLog,
+  getPlaces,
+  addPlace,
+  updatePlaceStatus,
+  deletePlace,
+  getRooms,
+  addRoom,
+  getSmartDevices,
+  addSmartDevice,
+  updateSmartDevice,
+  deleteSmartDevice,
+  purgeOldDecisionLogs
+};
