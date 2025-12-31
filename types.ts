@@ -48,6 +48,12 @@ export interface Memory {
     topic?: string;
     owner?: 'self' | 'friend' | 'work' | 'system' | string;
     origin?: 'manual' | 'transcript' | 'reminder' | 'preference' | 'import';
+    meeting_id?: string;
+    meeting_date?: string;
+    participants?: string[];
+    source?: 'audio' | 'document' | 'derived';
+    summary_of?: string;
+    summary_type?: 'overview' | 'decisions' | 'actions' | 'micro';
   };
 }
 
