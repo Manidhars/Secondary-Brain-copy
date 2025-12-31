@@ -272,7 +272,7 @@ export const addMemory = (params: any): Memory | null => {
     speaker: params.speaker || 'unknown',
     confidence: params.confidence ?? 0.9,
     salience: params.salience ?? 0.8,
-    trust_score: 1.0,
+    trust_score: params.trust_score ?? 1.0,
     confidence_history: [params.confidence ?? 0.9],
     status: 'active',
     recall_priority: params.recall_priority || 'normal',
@@ -626,27 +626,138 @@ export const importData = async (file: File) => true;
 export const factoryReset = () => { storage.clear(); window.location.reload(); };
 
 export const getTranscriptionLogs = (): TranscriptionLog[] => load<TranscriptionLog[]>(STORAGE_KEYS.TRANSCRIPTION_LOGS, []);
-export const addTranscriptionLog = (content: string, source: 'upload' | 'live', segments?: TranscriptSegment[]) => {
+// Pseudocode for Word document ingestion:
+// 1. Parse .docx text locally (e.g., using a client-side parser) to obtain raw text and author metadata.
+// 2. Call addTranscriptionLog(parsedText, 'upload', undefined, { meetingId, meetingDate, participants, sourceType: 'document' }).
+// 3. Store the resulting transcript memory under work/meetings/transcripts/{meetingId} with source=document.
+// 4. Allow the automatic summary seeds above to populate work/meetings/summaries/{meetingId}.
+export const addTranscriptionLog = (
+  content: string,
+  source: 'upload' | 'live',
+  segments?: TranscriptSegment[],
+  options?: {
+    meetingId?: string;
+    participants?: string[];
+    meetingDate?: string;
+    sourceType?: 'audio' | 'document';
+  }
+) => {
   const logs = getTranscriptionLogs();
+  const meetingId = options?.meetingId || `meeting-${Date.now()}`;
+  const meetingDate = options?.meetingDate || new Date().toISOString();
+  const sourceType: 'audio' | 'document' = options?.sourceType || 'audio';
+
   const newLog: TranscriptionLog = { id: crypto.randomUUID(), content, source, timestamp: Date.now(), segments };
   save(STORAGE_KEYS.TRANSCRIPTION_LOGS, [newLog, ...logs]);
 
-  // Mirror the transcript into memory for downstream retrieval/QA flows
+  // Persist the full transcript as high-trust, low-salience ground truth
+  const transcriptMemory = addMemory({
+    content,
+    domain: 'work',
+    type: 'raw',
+    entity: meetingId,
+    justification: 'Auto-ingested transcript',
+    salience: 0.35,
+    strength: 0.7,
+    trust_score: 0.98,
+    recall_priority: 'low',
+    metadata: {
+      folder: `work/meetings/transcripts/${meetingId}`,
+      table: 'transcripts',
+      topic: 'meeting transcript',
+      owner: 'work',
+      origin: 'transcript',
+      meeting_id: meetingId,
+      meeting_date: meetingDate,
+      participants: options?.participants,
+      source: sourceType
+    }
+  });
+
+  // Seed a lightweight overview summary for quick retrieval
   const summarySeed = content.split(/(?<=[.!?])\s+/).slice(0, 3).join(' ');
   addMemory({
     content: summarySeed || content.slice(0, 280),
     domain: 'work',
     type: 'summary',
-    entity: source === 'upload' ? 'meeting' : 'live_call',
-    justification: 'Auto-ingested transcript',
+    entity: meetingId,
+    justification: 'Overview derived from transcript',
+    salience: 0.7,
+    strength: 0.65,
     metadata: {
-      folder: 'work/calls',
+      folder: `work/meetings/summaries/${meetingId}`,
       table: 'transcripts',
-      topic: summarySeed ? summarySeed.slice(0, 60) : 'call',
+      topic: summarySeed ? summarySeed.slice(0, 60) : 'meeting overview',
       owner: 'work',
-      origin: 'transcript'
+      origin: 'transcript',
+      meeting_id: meetingId,
+      meeting_date: meetingDate,
+      participants: options?.participants,
+      source: 'derived',
+      summary_of: transcriptMemory?.id,
+      summary_type: 'overview'
     }
   });
+
+  // Attempt to capture decision and action hints without cloud inference
+  const decisionLines = content
+    .split(/\n|(?<=[.!?])\s+/)
+    .filter(l => /(decided|agreed|approved|chose)/i.test(l))
+    .slice(0, 3);
+  const actionLines = content
+    .split(/\n|(?<=[.!?])\s+/)
+    .filter(l => /(action item|next step|todo|follow up|assign)/i.test(l))
+    .slice(0, 3);
+
+  if (decisionLines.length > 0) {
+    addMemory({
+      content: decisionLines.join(' ').slice(0, 320),
+      domain: 'work',
+      type: 'summary',
+      entity: meetingId,
+      justification: 'Decisions noted from transcript',
+      salience: 0.65,
+      strength: 0.62,
+      metadata: {
+        folder: `work/meetings/summaries/${meetingId}`,
+        table: 'transcripts',
+        topic: 'decisions',
+        owner: 'work',
+        origin: 'transcript',
+        meeting_id: meetingId,
+        meeting_date: meetingDate,
+        participants: options?.participants,
+        source: 'derived',
+        summary_of: transcriptMemory?.id,
+        summary_type: 'decisions'
+      }
+    });
+  }
+
+  if (actionLines.length > 0) {
+    addMemory({
+      content: actionLines.join(' ').slice(0, 320),
+      domain: 'work',
+      type: 'summary',
+      entity: meetingId,
+      justification: 'Action items noted from transcript',
+      salience: 0.68,
+      strength: 0.64,
+      metadata: {
+        folder: `work/meetings/summaries/${meetingId}`,
+        table: 'transcripts',
+        topic: 'action items',
+        owner: 'work',
+        origin: 'transcript',
+        meeting_id: meetingId,
+        meeting_date: meetingDate,
+        participants: options?.participants,
+        source: 'derived',
+        summary_of: transcriptMemory?.id,
+        summary_type: 'actions'
+      }
+    });
+  }
 };
 export const deleteTranscriptionLog = (id: string) => save(STORAGE_KEYS.TRANSCRIPTION_LOGS, getTranscriptionLogs().filter(l => l.id !== id));
 
