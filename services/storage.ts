@@ -22,6 +22,80 @@ import {
   PendingProjectDecision,
   PendingPersonDecision
 } from '../types';
+import { Client } from 'pg';
+
+export interface StorageAdapter {
+  initializeStorage: () => Promise<void>;
+  getSettings: () => LLMSettings;
+  saveSettings: (settings: LLMSettings) => Promise<void>;
+  getMemories: () => Memory[];
+  getPendingProjectDecision: () => PendingProjectDecision | null;
+  savePendingProjectDecision: (pending: PendingProjectDecision | null) => void;
+  getPendingPersonDecision: () => PendingPersonDecision | null;
+  savePendingPersonDecision: (pending: PendingPersonDecision | null) => void;
+  addMemory: (params: any) => Memory | null;
+  approveMemory: (id: string) => void;
+  updateMemory: (id: string, updates: Partial<Memory>) => void;
+  deleteMemory: (id: string) => void;
+  getMemoriesInFolder: (folderPrefix: string) => Memory[];
+  trackMemoryAccess: (id: string, reason?: string) => void;
+  registerMemoryIgnored: (ids: string[], reason?: string) => void;
+  getPeople: () => Person[];
+  reinforceIdentity: (personId: string, reason: string) => number | null;
+  weakenIdentity: (personId: string, reason: string, sharp?: boolean) => number | null;
+  mergeIdentities: (
+    targetId: string,
+    sourceId: string,
+    reason: string
+  ) => { mergedInto: Person; snapshot: { target?: Person; source?: Person } } | null;
+  splitIdentityHypothesis: (sourceId: string, newName: string, factStr: string, reason: string) => Person;
+  updatePerson: (name: string, factStr: string, relation?: string) => void;
+  updatePersonConsent: (id: string, consent: boolean) => void;
+  addFactToPerson: (personId: string, content: string, source?: 'user' | 'inferred' | 'system') => void;
+  removeFactFromPerson: (personId: string, factId: string) => void;
+  getReminders: () => Reminder[];
+  upsertReminder: (task: string, dueTime: string, completed?: boolean) => Reminder;
+  completeReminder: (id: string, completed?: boolean) => void;
+  rescheduleReminder: (id: string, dueTime: string) => void;
+  getSessions: () => ChatSession[];
+  createSession: (mode?: 'active' | 'observer') => ChatSession;
+  updateSession: (id: string, messages: ChatMessage[]) => Promise<void>;
+  deleteSession: (id: string) => Promise<void>;
+  getUserProfile: () => UserProfile;
+  saveUserProfile: (profile: UserProfile) => Promise<void>;
+  getQueue: () => QueueItem[];
+  addToQueue: (content: string, type?: any) => Promise<void>;
+  removeFromQueue: (id: string) => Promise<void>;
+  updateQueueItem: (id: string, updates: any) => Promise<void>;
+  getDecisionLogs: () => DecisionLog[];
+  saveDecisionLog: (log: DecisionLog) => Promise<void>;
+  getStorageUsage: () => { usedKB: number; limitKB: number; percent: number };
+  runSystemBootCheck: () => string[];
+  runColdStorageMaintenance: () => void;
+  triggerSync: () => Promise<void>;
+  exportData: () => void;
+  importData: (file: File) => Promise<boolean>;
+  factoryReset: () => void;
+  getTranscriptionLogs: () => TranscriptionLog[];
+  addTranscriptionLog: (
+    content: string,
+    source: 'upload' | 'live',
+    segments?: TranscriptSegment[],
+    options?: { meetingId?: string; participants?: string[]; meetingDate?: string; sourceType?: 'audio' | 'document' }
+  ) => void;
+  deleteTranscriptionLog: (id: string) => Promise<void>;
+  getPlaces: () => Place[];
+  addPlace: (place: Partial<Place>) => void;
+  updatePlaceStatus: (id: string, status: Place['status']) => Promise<void>;
+  deletePlace: (id: string) => Promise<void>;
+  getRooms: () => Room[];
+  addRoom: (name: string, type: string) => Promise<void>;
+  getSmartDevices: () => SmartDevice[];
+  addSmartDevice: (device: Partial<SmartDevice>) => Promise<void>;
+  updateSmartDevice: (id: string, updates: Partial<SmartDevice>) => Promise<void>;
+  deleteSmartDevice: (id: string) => Promise<void>;
+  purgeOldDecisionLogs: () => void;
+}
 
 export interface StorageAdapter {
   initializeStorage: () => Promise<void>;
@@ -133,7 +207,81 @@ type IdentityAdjustmentEvent = {
   mergeIds?: { targetId: string; sourceId: string };
 };
 
-const storage = window.sessionStorage;
+type KeyValueBackend = {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+  removeItem: (key: string) => void;
+  ready?: Promise<void>;
+};
+
+class PostgresKeyValueStore implements KeyValueBackend {
+  private client: Client;
+  private cache = new Map<string, string>();
+  public ready: Promise<void>;
+
+  constructor(connectionString: string) {
+    this.client = new Client({ connectionString });
+    this.ready = this.initialize();
+  }
+
+  private async initialize() {
+    await this.client.connect();
+    await this.client.query(
+      `CREATE TABLE IF NOT EXISTS cliper_kv_store (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    );
+    const rows = await this.client.query('SELECT key, value FROM cliper_kv_store');
+    rows.rows.forEach((row: { key: string; value: any }) => {
+      const serialized = typeof row.value === 'string' ? row.value : JSON.stringify(row.value);
+      this.cache.set(row.key, serialized);
+    });
+  }
+
+  getItem(key: string) {
+    return this.cache.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string) {
+    this.cache.set(key, value);
+    void this.ready?.then(() =>
+      this.client.query(
+        'INSERT INTO cliper_kv_store(key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()',
+        [key, value]
+      )
+    );
+  }
+
+  removeItem(key: string) {
+    this.cache.delete(key);
+    void this.ready?.then(() => this.client.query('DELETE FROM cliper_kv_store WHERE key = $1', [key]));
+  }
+}
+
+const resolveBackend = (): KeyValueBackend => {
+  const backend = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_STORAGE_BACKEND) ||
+    (typeof process !== 'undefined' ? (process.env?.VITE_STORAGE_BACKEND as string) : undefined) ||
+    'session';
+
+  if (backend === 'postgres') {
+    const connectionString =
+      (typeof import.meta !== 'undefined' && import.meta.env?.VITE_POSTGRES_URL) ||
+      (typeof process !== 'undefined' ? process.env?.VITE_POSTGRES_URL : undefined);
+
+    if (!connectionString) {
+      console.warn('[Cliper] VITE_POSTGRES_URL not set; falling back to session storage.');
+      return window.sessionStorage;
+    }
+
+    return new PostgresKeyValueStore(connectionString);
+  }
+
+  return window.sessionStorage;
+};
+
+const storage: KeyValueBackend = resolveBackend();
 
 const clampStrength = (value: number) => Math.min(1.25, Math.max(0.05, value));
 const clampIdentityConfidence = (value: number) => Math.min(0.98, Math.max(0.05, value));
@@ -270,7 +418,13 @@ const load = <T,>(key: string, fallback: T): T => {
 };
 
 export const initializeStorage = async () => {
-    console.log("[Cliper] Volatile memory initialized.");
+  if (storage.ready) {
+    await storage.ready;
+    console.log('[Cliper] Postgres storage initialized.');
+    return;
+  }
+
+  console.log('[Cliper] Volatile memory initialized.');
 };
 
 export const getSettings = (): LLMSettings => {
