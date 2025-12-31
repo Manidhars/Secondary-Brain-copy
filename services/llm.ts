@@ -1152,6 +1152,97 @@ const decomposeUserQuery = async (msg: string): Promise<string[]> => {
     return chunks.length > 0 ? chunks : [msg];
 };
 
+const rankQueryMatches = (memories: Memory[], queries: string[]) => {
+    return memories
+        .map(memory => {
+            const lower = memory.content.toLowerCase();
+            const matched = queries.filter(q => lower.includes(q.toLowerCase()));
+            if (matched.length === 0) return null;
+
+            const signal = matched.length * 0.4;
+            const salience = memory.salience ?? 0.5;
+            const trust = memory.trust_score ?? 0.85;
+            const strength = memory.strength ?? 0.6;
+            const score = signal + salience * 0.3 + trust * 0.2 + strength * 0.1;
+
+            return { memory, score, matchedQueries: matched.map(q => q.toLowerCase()) };
+        })
+        .filter(Boolean)
+        .sort((a, b) => (b as any).score - (a as any).score) as { memory: Memory; score: number; matchedQueries: string[] }[];
+};
+
+const createMicroSummaryFromTranscript = (transcript: Memory, queries: string[]) => {
+    if (!transcript.metadata?.meeting_id) return;
+
+    const lower = transcript.content.toLowerCase();
+    const match = queries.find(q => lower.includes(q.toLowerCase()));
+    const excerptStart = match ? lower.indexOf(match.toLowerCase()) : 0;
+    const excerpt = transcript.content.slice(Math.max(0, excerptStart - 60), excerptStart + 180).trim();
+
+    addMemory({
+        content: `Micro-summary: ${excerpt}`.slice(0, 320),
+        domain: 'work',
+        type: 'summary',
+        entity: transcript.entity || transcript.metadata.meeting_id,
+        justification: 'Micro-summary created after transcript fallback',
+        salience: 0.72,
+        strength: 0.66,
+        metadata: {
+            folder: `work/meetings/summaries/${transcript.metadata.meeting_id}`,
+            table: 'transcripts',
+            topic: 'micro-summary',
+            owner: 'work',
+            origin: 'transcript',
+            meeting_id: transcript.metadata.meeting_id,
+            meeting_date: transcript.metadata.meeting_date,
+            participants: transcript.metadata.participants,
+            source: 'derived',
+            summary_of: transcript.id,
+            summary_type: 'micro'
+        }
+    });
+};
+
+const deriveWorkMemoryPlan = (queries: string[], searchSpace: Memory[], limit: number) => {
+    const summaries = searchSpace.filter(m => (m.metadata?.folder || '').toLowerCase().startsWith('work/meetings/summaries'));
+    const transcripts = searchSpace.filter(m => (m.metadata?.folder || '').toLowerCase().startsWith('work/meetings/transcripts'));
+
+    const rankedSummaries = rankQueryMatches(summaries, queries);
+    const topSummaries = rankedSummaries.slice(0, limit);
+
+    const covered = new Set<string>();
+    topSummaries.forEach(r => r.matchedQueries.forEach(q => covered.add(q)));
+    const unresolvedQueries = queries.filter(q => !covered.has(q.toLowerCase()));
+
+    const fallbackTriggered = topSummaries.length === 0 || unresolvedQueries.length > 0;
+    const ignoredFromSummaries = summaries
+        .filter(m => !topSummaries.find(r => r.memory.id === m.id))
+        .map(m => m.id);
+
+    if (!fallbackTriggered) {
+        return { candidates: topSummaries.map(r => r.memory), ignoredIds: ignoredFromSummaries, fallbackTriggered };
+    }
+
+    // Summary-first search exhausted; pivot to transcript fallback.
+    const rankedTranscripts = rankQueryMatches(transcripts, queries);
+    const transcriptCandidates = rankedTranscripts.slice(0, limit);
+
+    // Create micro-summaries to reinforce future summary-first retrieval
+    transcriptCandidates.slice(0, 2).forEach(match => createMicroSummaryFromTranscript(match.memory, queries));
+
+    const combined = [...topSummaries.map(r => r.memory), ...transcriptCandidates.map(r => r.memory)]
+        .slice(0, limit);
+    const ignoredFromTranscripts = transcripts
+        .filter(m => !combined.find(c => c.id === m.id))
+        .map(m => m.id);
+
+    return {
+        candidates: combined,
+        ignoredIds: [...ignoredFromSummaries, ...ignoredFromTranscripts],
+        fallbackTriggered
+    };
+};
+
 export const consultBrain = async (
   history: { role: string; content: string; images?: string[] }[],
   currentMessage: string,
@@ -1217,33 +1308,52 @@ export const consultBrain = async (
           if (fallback.length > 0) searchSpace = fallback;
       }
   }
-  
-  const relevantFragments = new Set<Memory>();
-  for (const q of searchQueries) {
-      const lowerQ = q.toLowerCase();
-      searchSpace.forEach(m => {
-          if (m.content.toLowerCase().includes(lowerQ) || m.isPinned) {
-              relevantFragments.add(m);
-          }
-      });
-  }
-
   const candidateLimit = systemStatus === 'degraded' ? 3 : 8;
-  const candidates = Array.from(relevantFragments)
-      .sort(
+  const isWorkRelated = folderScopes.includes('work') || /meeting|action item|decision/i.test(currentMessage);
+  let candidates: Memory[] = [];
+  let ignored: string[] = [];
+  let fallbackTriggered = false;
+
+  if (isWorkRelated) {
+      // Summary-first search with transcript fallback for work memories
+      const plan = deriveWorkMemoryPlan(searchQueries, searchSpace, candidateLimit);
+      candidates = plan.candidates.sort(
         (a, b) =>
           (b.salience * b.trust_score * (b.strength ?? 0.6)) -
           (a.salience * a.trust_score * (a.strength ?? 0.6))
-      )
-      .slice(0, candidateLimit);
+      );
+      ignored = plan.ignoredIds;
+      fallbackTriggered = plan.fallbackTriggered;
+  } else {
+      const relevantFragments = new Set<Memory>();
+      for (const q of searchQueries) {
+          const lowerQ = q.toLowerCase();
+          searchSpace.forEach(m => {
+              if (m.content.toLowerCase().includes(lowerQ) || m.isPinned) {
+                  relevantFragments.add(m);
+              }
+          });
+      }
 
-  const ignored = Array.from(relevantFragments)
-    .filter(m => !candidates.includes(m))
-    .map(m => m.id);
-  registerMemoryIgnored(ignored, 'Memory surfaced but not selected');
+      candidates = Array.from(relevantFragments)
+          .sort(
+            (a, b) =>
+              (b.salience * b.trust_score * (b.strength ?? 0.6)) -
+              (a.salience * a.trust_score * (a.strength ?? 0.6))
+          )
+          .slice(0, candidateLimit);
+
+      ignored = Array.from(relevantFragments)
+        .filter(m => !candidates.includes(m))
+        .map(m => m.id);
+  }
+
+  if (ignored.length > 0) {
+    registerMemoryIgnored(ignored, 'Memory surfaced but not selected');
+  }
 
   const replyHeader = candidates.length > 0
-    ? `Local-only mode: responding with cached context from ${candidates.length} memories.`
+    ? `Local-only mode: responding with cached context from ${candidates.length} memories${fallbackTriggered ? ' (transcript fallback engaged)' : ''}.`
     : 'Local-only mode: no cached memories matched; consider adding more context.';
 
   const replyBody = candidates.map(c => `• ${c.content}`).join("\n");

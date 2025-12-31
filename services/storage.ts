@@ -1,9 +1,101 @@
 import {
-  Memory, Person, Reminder, Place, MemoryType, MemoryDomain, ChatMessage, MemoryStatus,
-  ChatSession, LLMSettings, UserProfile, QueueItem, TranscriptionLog,
-  SmartDevice, Room, ConnectionProtocol, RecallPriority, DecisionLog, PersonFact, TranscriptSegment,
-  PendingProjectDecision, PendingPersonDecision
+  Memory,
+  Person,
+  Reminder,
+  Place,
+  MemoryType,
+  MemoryDomain,
+  ChatMessage,
+  MemoryStatus,
+  ChatSession,
+  LLMSettings,
+  UserProfile,
+  QueueItem,
+  TranscriptionLog,
+  SmartDevice,
+  Room,
+  ConnectionProtocol,
+  RecallPriority,
+  DecisionLog,
+  PersonFact,
+  TranscriptSegment,
+  PendingProjectDecision,
+  PendingPersonDecision
 } from '../types';
+import { Client } from 'pg';
+
+export interface StorageAdapter {
+  initializeStorage: () => Promise<void>;
+  getSettings: () => LLMSettings;
+  saveSettings: (settings: LLMSettings) => Promise<void>;
+  getMemories: () => Memory[];
+  getPendingProjectDecision: () => PendingProjectDecision | null;
+  savePendingProjectDecision: (pending: PendingProjectDecision | null) => void;
+  getPendingPersonDecision: () => PendingPersonDecision | null;
+  savePendingPersonDecision: (pending: PendingPersonDecision | null) => void;
+  addMemory: (params: any) => Memory | null;
+  approveMemory: (id: string) => void;
+  updateMemory: (id: string, updates: Partial<Memory>) => void;
+  deleteMemory: (id: string) => void;
+  getMemoriesInFolder: (folderPrefix: string) => Memory[];
+  trackMemoryAccess: (id: string, reason?: string) => void;
+  registerMemoryIgnored: (ids: string[], reason?: string) => void;
+  getPeople: () => Person[];
+  reinforceIdentity: (personId: string, reason: string) => number | null;
+  weakenIdentity: (personId: string, reason: string, sharp?: boolean) => number | null;
+  mergeIdentities: (
+    targetId: string,
+    sourceId: string,
+    reason: string
+  ) => { mergedInto: Person; snapshot: { target?: Person; source?: Person } } | null;
+  splitIdentityHypothesis: (sourceId: string, newName: string, factStr: string, reason: string) => Person;
+  updatePerson: (name: string, factStr: string, relation?: string) => void;
+  updatePersonConsent: (id: string, consent: boolean) => void;
+  addFactToPerson: (personId: string, content: string, source?: 'user' | 'inferred' | 'system') => void;
+  removeFactFromPerson: (personId: string, factId: string) => void;
+  getReminders: () => Reminder[];
+  upsertReminder: (task: string, dueTime: string, completed?: boolean) => Reminder;
+  completeReminder: (id: string, completed?: boolean) => void;
+  rescheduleReminder: (id: string, dueTime: string) => void;
+  getSessions: () => ChatSession[];
+  createSession: (mode?: 'active' | 'observer') => ChatSession;
+  updateSession: (id: string, messages: ChatMessage[]) => Promise<void>;
+  deleteSession: (id: string) => Promise<void>;
+  getUserProfile: () => UserProfile;
+  saveUserProfile: (profile: UserProfile) => Promise<void>;
+  getQueue: () => QueueItem[];
+  addToQueue: (content: string, type?: any) => Promise<void>;
+  removeFromQueue: (id: string) => Promise<void>;
+  updateQueueItem: (id: string, updates: any) => Promise<void>;
+  getDecisionLogs: () => DecisionLog[];
+  saveDecisionLog: (log: DecisionLog) => Promise<void>;
+  getStorageUsage: () => { usedKB: number; limitKB: number; percent: number };
+  runSystemBootCheck: () => string[];
+  runColdStorageMaintenance: () => void;
+  triggerSync: () => Promise<void>;
+  exportData: () => void;
+  importData: (file: File) => Promise<boolean>;
+  factoryReset: () => void;
+  getTranscriptionLogs: () => TranscriptionLog[];
+  addTranscriptionLog: (
+    content: string,
+    source: 'upload' | 'live',
+    segments?: TranscriptSegment[],
+    options?: { meetingId?: string; participants?: string[]; meetingDate?: string; sourceType?: 'audio' | 'document' }
+  ) => void;
+  deleteTranscriptionLog: (id: string) => Promise<void>;
+  getPlaces: () => Place[];
+  addPlace: (place: Partial<Place>) => void;
+  updatePlaceStatus: (id: string, status: Place['status']) => Promise<void>;
+  deletePlace: (id: string) => Promise<void>;
+  getRooms: () => Room[];
+  addRoom: (name: string, type: string) => Promise<void>;
+  getSmartDevices: () => SmartDevice[];
+  addSmartDevice: (device: Partial<SmartDevice>) => Promise<void>;
+  updateSmartDevice: (id: string, updates: Partial<SmartDevice>) => Promise<void>;
+  deleteSmartDevice: (id: string) => Promise<void>;
+  purgeOldDecisionLogs: () => void;
+}
 
 const STORAGE_KEYS = {
   MEMORIES: 'cliper_memories',
@@ -42,7 +134,81 @@ type IdentityAdjustmentEvent = {
   mergeIds?: { targetId: string; sourceId: string };
 };
 
-const storage = window.sessionStorage;
+type KeyValueBackend = {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+  removeItem: (key: string) => void;
+  ready?: Promise<void>;
+};
+
+class PostgresKeyValueStore implements KeyValueBackend {
+  private client: Client;
+  private cache = new Map<string, string>();
+  public ready: Promise<void>;
+
+  constructor(connectionString: string) {
+    this.client = new Client({ connectionString });
+    this.ready = this.initialize();
+  }
+
+  private async initialize() {
+    await this.client.connect();
+    await this.client.query(
+      `CREATE TABLE IF NOT EXISTS cliper_kv_store (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`
+    );
+    const rows = await this.client.query('SELECT key, value FROM cliper_kv_store');
+    rows.rows.forEach((row: { key: string; value: any }) => {
+      const serialized = typeof row.value === 'string' ? row.value : JSON.stringify(row.value);
+      this.cache.set(row.key, serialized);
+    });
+  }
+
+  getItem(key: string) {
+    return this.cache.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string) {
+    this.cache.set(key, value);
+    void this.ready?.then(() =>
+      this.client.query(
+        'INSERT INTO cliper_kv_store(key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()',
+        [key, value]
+      )
+    );
+  }
+
+  removeItem(key: string) {
+    this.cache.delete(key);
+    void this.ready?.then(() => this.client.query('DELETE FROM cliper_kv_store WHERE key = $1', [key]));
+  }
+}
+
+const resolveBackend = (): KeyValueBackend => {
+  const backend = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_STORAGE_BACKEND) ||
+    (typeof process !== 'undefined' ? (process.env?.VITE_STORAGE_BACKEND as string) : undefined) ||
+    'session';
+
+  if (backend === 'postgres') {
+    const connectionString =
+      (typeof import.meta !== 'undefined' && import.meta.env?.VITE_POSTGRES_URL) ||
+      (typeof process !== 'undefined' ? process.env?.VITE_POSTGRES_URL : undefined);
+
+    if (!connectionString) {
+      console.warn('[Cliper] VITE_POSTGRES_URL not set; falling back to session storage.');
+      return window.sessionStorage;
+    }
+
+    return new PostgresKeyValueStore(connectionString);
+  }
+
+  return window.sessionStorage;
+};
+
+const storage: KeyValueBackend = resolveBackend();
 
 const clampStrength = (value: number) => Math.min(1.25, Math.max(0.05, value));
 const clampIdentityConfidence = (value: number) => Math.min(0.98, Math.max(0.05, value));
@@ -179,7 +345,13 @@ const load = <T,>(key: string, fallback: T): T => {
 };
 
 export const initializeStorage = async () => {
-    console.log("[Cliper] Volatile memory initialized.");
+  if (storage.ready) {
+    await storage.ready;
+    console.log('[Cliper] Postgres storage initialized.');
+    return;
+  }
+
+  console.log('[Cliper] Volatile memory initialized.');
 };
 
 export const getSettings = (): LLMSettings => {
@@ -272,7 +444,7 @@ export const addMemory = (params: any): Memory | null => {
     speaker: params.speaker || 'unknown',
     confidence: params.confidence ?? 0.9,
     salience: params.salience ?? 0.8,
-    trust_score: 1.0,
+    trust_score: params.trust_score ?? 1.0,
     confidence_history: [params.confidence ?? 0.9],
     status: 'active',
     recall_priority: params.recall_priority || 'normal',
@@ -626,27 +798,138 @@ export const importData = async (file: File) => true;
 export const factoryReset = () => { storage.clear(); window.location.reload(); };
 
 export const getTranscriptionLogs = (): TranscriptionLog[] => load<TranscriptionLog[]>(STORAGE_KEYS.TRANSCRIPTION_LOGS, []);
-export const addTranscriptionLog = (content: string, source: 'upload' | 'live', segments?: TranscriptSegment[]) => {
+// Pseudocode for Word document ingestion:
+// 1. Parse .docx text locally (e.g., using a client-side parser) to obtain raw text and author metadata.
+// 2. Call addTranscriptionLog(parsedText, 'upload', undefined, { meetingId, meetingDate, participants, sourceType: 'document' }).
+// 3. Store the resulting transcript memory under work/meetings/transcripts/{meetingId} with source=document.
+// 4. Allow the automatic summary seeds above to populate work/meetings/summaries/{meetingId}.
+export const addTranscriptionLog = (
+  content: string,
+  source: 'upload' | 'live',
+  segments?: TranscriptSegment[],
+  options?: {
+    meetingId?: string;
+    participants?: string[];
+    meetingDate?: string;
+    sourceType?: 'audio' | 'document';
+  }
+) => {
   const logs = getTranscriptionLogs();
+  const meetingId = options?.meetingId || `meeting-${Date.now()}`;
+  const meetingDate = options?.meetingDate || new Date().toISOString();
+  const sourceType: 'audio' | 'document' = options?.sourceType || 'audio';
+
   const newLog: TranscriptionLog = { id: crypto.randomUUID(), content, source, timestamp: Date.now(), segments };
   save(STORAGE_KEYS.TRANSCRIPTION_LOGS, [newLog, ...logs]);
 
-  // Mirror the transcript into memory for downstream retrieval/QA flows
+  // Persist the full transcript as high-trust, low-salience ground truth
+  const transcriptMemory = addMemory({
+    content,
+    domain: 'work',
+    type: 'raw',
+    entity: meetingId,
+    justification: 'Auto-ingested transcript',
+    salience: 0.35,
+    strength: 0.7,
+    trust_score: 0.98,
+    recall_priority: 'low',
+    metadata: {
+      folder: `work/meetings/transcripts/${meetingId}`,
+      table: 'transcripts',
+      topic: 'meeting transcript',
+      owner: 'work',
+      origin: 'transcript',
+      meeting_id: meetingId,
+      meeting_date: meetingDate,
+      participants: options?.participants,
+      source: sourceType
+    }
+  });
+
+  // Seed a lightweight overview summary for quick retrieval
   const summarySeed = content.split(/(?<=[.!?])\s+/).slice(0, 3).join(' ');
   addMemory({
     content: summarySeed || content.slice(0, 280),
     domain: 'work',
     type: 'summary',
-    entity: source === 'upload' ? 'meeting' : 'live_call',
-    justification: 'Auto-ingested transcript',
+    entity: meetingId,
+    justification: 'Overview derived from transcript',
+    salience: 0.7,
+    strength: 0.65,
     metadata: {
-      folder: 'work/calls',
+      folder: `work/meetings/summaries/${meetingId}`,
       table: 'transcripts',
-      topic: summarySeed ? summarySeed.slice(0, 60) : 'call',
+      topic: summarySeed ? summarySeed.slice(0, 60) : 'meeting overview',
       owner: 'work',
-      origin: 'transcript'
+      origin: 'transcript',
+      meeting_id: meetingId,
+      meeting_date: meetingDate,
+      participants: options?.participants,
+      source: 'derived',
+      summary_of: transcriptMemory?.id,
+      summary_type: 'overview'
     }
   });
+
+  // Attempt to capture decision and action hints without cloud inference
+  const decisionLines = content
+    .split(/\n|(?<=[.!?])\s+/)
+    .filter(l => /(decided|agreed|approved|chose)/i.test(l))
+    .slice(0, 3);
+  const actionLines = content
+    .split(/\n|(?<=[.!?])\s+/)
+    .filter(l => /(action item|next step|todo|follow up|assign)/i.test(l))
+    .slice(0, 3);
+
+  if (decisionLines.length > 0) {
+    addMemory({
+      content: decisionLines.join(' ').slice(0, 320),
+      domain: 'work',
+      type: 'summary',
+      entity: meetingId,
+      justification: 'Decisions noted from transcript',
+      salience: 0.65,
+      strength: 0.62,
+      metadata: {
+        folder: `work/meetings/summaries/${meetingId}`,
+        table: 'transcripts',
+        topic: 'decisions',
+        owner: 'work',
+        origin: 'transcript',
+        meeting_id: meetingId,
+        meeting_date: meetingDate,
+        participants: options?.participants,
+        source: 'derived',
+        summary_of: transcriptMemory?.id,
+        summary_type: 'decisions'
+      }
+    });
+  }
+
+  if (actionLines.length > 0) {
+    addMemory({
+      content: actionLines.join(' ').slice(0, 320),
+      domain: 'work',
+      type: 'summary',
+      entity: meetingId,
+      justification: 'Action items noted from transcript',
+      salience: 0.68,
+      strength: 0.64,
+      metadata: {
+        folder: `work/meetings/summaries/${meetingId}`,
+        table: 'transcripts',
+        topic: 'action items',
+        owner: 'work',
+        origin: 'transcript',
+        meeting_id: meetingId,
+        meeting_date: meetingDate,
+        participants: options?.participants,
+        source: 'derived',
+        summary_of: transcriptMemory?.id,
+        summary_type: 'actions'
+      }
+    });
+  }
 };
 export const deleteTranscriptionLog = (id: string) => save(STORAGE_KEYS.TRANSCRIPTION_LOGS, getTranscriptionLogs().filter(l => l.id !== id));
 
@@ -683,3 +966,67 @@ export const updateSmartDevice = (id: string, updates: Partial<SmartDevice>) => 
 export const deleteSmartDevice = (id: string) => save(STORAGE_KEYS.SMART_DEVICES, getSmartDevices().filter(d => d.id !== id));
 
 export const purgeOldDecisionLogs = () => {};
+
+export const storageAdapter: StorageAdapter = {
+  initializeStorage,
+  getSettings,
+  saveSettings,
+  getMemories,
+  getPendingProjectDecision,
+  savePendingProjectDecision,
+  getPendingPersonDecision,
+  savePendingPersonDecision,
+  addMemory,
+  approveMemory,
+  updateMemory,
+  deleteMemory,
+  getMemoriesInFolder,
+  trackMemoryAccess,
+  registerMemoryIgnored,
+  getPeople,
+  reinforceIdentity,
+  weakenIdentity,
+  mergeIdentities,
+  splitIdentityHypothesis,
+  updatePerson,
+  updatePersonConsent,
+  addFactToPerson,
+  removeFactFromPerson,
+  getReminders,
+  upsertReminder,
+  completeReminder,
+  rescheduleReminder,
+  getSessions,
+  createSession,
+  updateSession,
+  deleteSession,
+  getUserProfile,
+  saveUserProfile,
+  getQueue,
+  addToQueue,
+  removeFromQueue,
+  updateQueueItem,
+  getDecisionLogs,
+  saveDecisionLog,
+  getStorageUsage,
+  runSystemBootCheck,
+  runColdStorageMaintenance,
+  triggerSync,
+  exportData,
+  importData,
+  factoryReset,
+  getTranscriptionLogs,
+  addTranscriptionLog,
+  deleteTranscriptionLog,
+  getPlaces,
+  addPlace,
+  updatePlaceStatus,
+  deletePlace,
+  getRooms,
+  addRoom,
+  getSmartDevices,
+  addSmartDevice,
+  updateSmartDevice,
+  deleteSmartDevice,
+  purgeOldDecisionLogs
+};
